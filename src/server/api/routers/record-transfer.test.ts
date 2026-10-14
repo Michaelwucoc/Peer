@@ -327,6 +327,17 @@ it("exports re-importable files and excludes credentials and verification tokens
 it.each([
   ["User", { id: "new", email: "new@example.test" }, /Account reference/],
   ["Tutor", { id: "t", englishName: "Name", status: "INVALID" }, /status/],
+  // A mail-feeding column: a CR/LF cell would let the mailer parse a second address.
+  [
+    "Tutor",
+    {
+      id: "crlf-mail",
+      englishName: "Crlf Mail",
+      email: "tutor@example.test\nBcc: attacker@evil.test",
+    },
+    /plain email address/,
+  ],
+  ["Tutor", { id: "display-name", englishName: "A Name", email: "A Name <a@example.test>" }, /plain email address/],
   [
     "Term",
     {
@@ -411,4 +422,26 @@ it("rejects impossible calendar dates instead of normalizing them", async () => 
       ],
     }),
   ).rejects.toThrow(/invalid calendar date/);
+});
+
+it("keeps one plain tutor address, trimmed, for the invitation mail", async () => {
+  const files = [
+    file("Tutor", [
+      {
+        id: "mail-tutor",
+        englishName: "Mail Tutor",
+        email: "  Mail.Tutor@example.test ",
+      },
+    ]),
+  ];
+  const preview = await caller().recordTransfer.preview({ files });
+  await caller().recordTransfer.import({ files, ticket: preview.ticket });
+  expect(
+    (
+      await db.tutor.findUniqueOrThrow({
+        where: { id: "mail-tutor" },
+        select: { email: true },
+      })
+    ).email,
+  ).toBe("Mail.Tutor@example.test");
 });

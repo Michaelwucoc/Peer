@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   authorize: undefined as Authorize | undefined,
   verifyPassword: vi.fn(),
   verifyCode: vi.fn(),
+  signinLimited: vi.fn(),
   credentialState: vi.fn(),
   updateUser: vi.fn(),
 }));
@@ -17,7 +18,7 @@ vi.mock("~/server/transactions", () => ({ lockEntity: vi.fn() }));
 vi.mock("~/server/account-profile", () => ({ lockAccountProfile: vi.fn(), updateAccountProfile: vi.fn() }));
 vi.mock("./tutor-link", () => ({ resolveTutorLink: async () => null }));
 vi.mock("./username", () => ({ ensureUserUsername: vi.fn() }));
-vi.mock("./credentials", () => ({ clientIpFromRequest: () => "test-ip", verifySigninPassword: mocks.verifyPassword }));
+vi.mock("./credentials", () => ({ clientIpFromRequest: () => "test-ip", signinRateLimited: (): boolean => Boolean(mocks.signinLimited()), verifySigninPassword: mocks.verifyPassword }));
 vi.mock("./two-factor", () => ({ verifyLoginCode: mocks.verifyCode }));
 vi.mock("~/server/program/features", () => ({ getFeatures: async () => ({ EMAIL_2FA: true }) }));
 vi.mock("next-auth/providers/credentials", () => ({ default: (config: object) => config }));
@@ -40,7 +41,7 @@ vi.mock("next-auth", () => ({
 }));
 import "./index";
 
-beforeEach(() => { mocks.findUser.mockReset(); mocks.verifyPassword.mockReset(); mocks.verifyCode.mockReset(); mocks.credentialState.mockReset(); mocks.updateUser.mockReset(); });
+beforeEach(() => { mocks.findUser.mockReset(); mocks.verifyPassword.mockReset(); mocks.verifyCode.mockReset(); mocks.signinLimited.mockReset(); mocks.credentialState.mockReset(); mocks.updateUser.mockReset(); });
 
 it("invalidates a deleted student session instead of leaving a sign-in redirect loop", async () => {
   mocks.findUser.mockResolvedValue(null);
@@ -78,6 +79,18 @@ it("does not let a suspended 2FA user bypass the emailed code with a password-on
   mocks.verifyPassword.mockResolvedValue({ ok: true, user: { id: "suspended", email: "suspended@example.test", twoFactorEnabled: true } });
   await expect(mocks.authorize!({ identifier: "suspended@example.test", password: "Password123!" }, new Request("http://localhost")))
     .rejects.toMatchObject({ code: "two_factor_required" });
+});
+
+it("counts an emailed-code attempt against the sign-in throttle before verifying it", async () => {
+  mocks.findUser.mockResolvedValue({ id: "suspended", email: "suspended@example.test", twoFactorEnabled: true, suspendedAt: new Date() });
+  mocks.signinLimited.mockReturnValue(true);
+  await expect(
+    mocks.authorize!(
+      { intent: "login_2fa", userId: "suspended", code: "ABCDE" },
+      new Request("http://localhost/api/auth/callback/credentials"),
+    ),
+  ).rejects.toMatchObject({ code: "rate_limited" });
+  expect(mocks.verifyCode).not.toHaveBeenCalled();
 });
 
 // Credential evidence keeps the generation captured before a reset, even when issuance resumes later.

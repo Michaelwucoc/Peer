@@ -29,6 +29,24 @@ export function clientIpFromRequest(request: Request | undefined): string {
 }
 
 /**
+ * The sign-in throttle shared by every credential attempt: a password POST and an emailed-code
+ * POST count against the same per-network and per-identifier budgets, so the code path is
+ * covered as well.
+ */
+export function signinRateLimited(ip: string, identifier: string): boolean {
+  const withinLimit =
+    rateLimit(`signin:ip:${ip}`, {
+      max: SIGNIN_MAX_PER_IP,
+      windowMs: SIGNIN_WINDOW_MS,
+    }).ok &&
+    rateLimit(`signin:id:${identifier}`, {
+      max: SIGNIN_MAX_PER_IDENTIFIER,
+      windowMs: SIGNIN_WINDOW_MS,
+    }).ok;
+  return !withinLimit;
+}
+
+/**
  * Look up only the sign-in routing state. This intentionally does not verify a password or consume
  * a rate-limit attempt; Auth.js remains the sole verifier for ordinary, non-2FA sign-ins.
  */
@@ -59,16 +77,7 @@ export async function verifySigninPassword(
   const identifier = identifierInput.trim().toLowerCase();
   if (!identifier || !password) return { ok: false, reason: "invalid" };
 
-  const withinLimit =
-    rateLimit(`signin:ip:${ip}`, {
-      max: SIGNIN_MAX_PER_IP,
-      windowMs: SIGNIN_WINDOW_MS,
-    }).ok &&
-    rateLimit(`signin:id:${identifier}`, {
-      max: SIGNIN_MAX_PER_IDENTIFIER,
-      windowMs: SIGNIN_WINDOW_MS,
-    }).ok;
-  if (!withinLimit) return { ok: false, reason: "rate_limited" };
+  if (signinRateLimited(ip, identifier)) return { ok: false, reason: "rate_limited" };
 
   const user = await db.user.findFirst({
     where: {

@@ -22,8 +22,13 @@
 {$DOMAIN} {
 	import browser_security_headers
 	reverse_proxy app:3000 {
-		# Single public proxy: overwrite, never append a client-supplied identity.
+		# Single public proxy: overwrite every visitor-identity header, never append it, so a
+		# client-supplied value cannot select its own per-network throttle bucket. The app
+		# reads the dedicated signup header and the leftmost X-Forwarded-For / X-Real-IP;
+		# keep the application port private (see docs/deployment.md).
 		header_up X-Signup-Client-IP {remote_host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
 	}
 	# Deferred response headers do not run when an upstream connection fails.
 	# Reuse the policy on that error path without exposing internal error details.

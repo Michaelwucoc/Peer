@@ -16,9 +16,30 @@ export const LANDING_OWNER = "landing";
 
 const localized = z.record(z.string());
 
+/**
+ * A button destination is an in-app path, a fragment, or an absolute `http(s)`/`mailto`
+ * link. A non-`/`-prefixed value reaches a raw `<a href>`, so a stored `javascript:`
+ * (or `data:`) value would run in a visitor's origin when clicked. A blank value is a
+ * destination-less button: keep it out of the renderer, but let the editor save a
+ * half-filled row.
+ */
+export function isSafeButtonHref(value: string): boolean {
+  const href = value.trim();
+  if (!href) return false;
+  if (href.startsWith("/") || href.startsWith("#")) return true;
+  return /^(?:https?:|mailto:)/i.test(href);
+}
+
+/** The stored contract is stricter than the renderer: a blank row must stay saveable. */
+function isStorableButtonHref(value: string): boolean {
+  return value.trim() === "" || isSafeButtonHref(value);
+}
+
 const buttonSchema = z.object({
   label: localized,
-  href: z.string().max(2000),
+  href: z.string().max(2000).refine(isStorableButtonHref, {
+    message: "Button link must be an in-app path or an http(s)/mailto URL.",
+  }),
   style: z.enum(["primary", "secondary"]),
 });
 

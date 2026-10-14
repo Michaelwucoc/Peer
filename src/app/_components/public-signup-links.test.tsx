@@ -44,3 +44,27 @@ it("normalizes Markdown destinations while retaining private and external links"
     screen.getByRole("link", { name: "External" }).getAttribute("href"),
   ).toBe("https://example.test/signup");
 });
+
+it("drops a button stored with a scheme a raw anchor would execute", () => {
+  const block = {
+    id: "legacy",
+    type: "BUTTONS" as const,
+    buttons: [
+      {
+        label: { en: "Apply" },
+        href: "javascript:fetch('/api/session-identity')",
+        style: "primary" as const,
+      },
+      {
+        label: { en: "Learn more" },
+        href: "https://example.test/signup",
+        style: "secondary" as const,
+      },
+    ],
+  };
+  render(<ButtonRow block={block} locale="en" />);
+  expect(screen.queryByRole("link", { name: "Apply" })).toBeNull();
+  expect(screen.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe(
+    "https://example.test/signup",
+  );
+});

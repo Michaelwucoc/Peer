@@ -17,9 +17,43 @@ const globalForRateLimit = globalThis as unknown as {
 };
 const store = (globalForRateLimit.rateLimitStore ??= new Map<string, Entry>());
 
-/** Drop keys with no recent hits so the map can't grow unbounded across many distinct keys. */
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const SWEEP_TTL_MS = 60 * 60_000;
+/** Hard ceiling on live buckets; a rotating identity can reach it within one window. */
+const MAX_KEYS = 10_000;
+
+/** The namespace a bucket belongs to (the text before its first `:`). */
+function namespaceOf(key: string): string {
+  const separator = key.indexOf(":");
+  return separator === -1 ? key : key.slice(0, separator);
+}
+
+/**
+ * Reclaim one bucket when the table is full. Prefer the caller's own namespace, so a
+ * rotating identity frees its own kind of bucket and an unrelated tenant keeps its count;
+ * fall back to the least recently seen bucket anywhere.
+ */
+function evictOne(namespace: string): void {
+  let oldestKey: string | undefined;
+  let oldestAt = Infinity;
+  let namespacedKey: string | undefined;
+  let namespacedAt = Infinity;
+  for (const [key, entry] of store) {
+    const last = entry.hits[entry.hits.length - 1] ?? 0;
+    if (namespaceOf(key) === namespace && last <= namespacedAt) {
+      namespacedAt = last;
+      namespacedKey = key;
+    }
+    if (last <= oldestAt) {
+      oldestAt = last;
+      oldestKey = key;
+    }
+  }
+  const victim = namespacedKey ?? oldestKey;
+  if (victim !== undefined) store.delete(victim);
+}
+
+/** Drop keys with no recent hits so the map can't grow unbounded across many distinct keys. */
 function maybeSweep(now: number): void {
   if (now - (globalForRateLimit.rateLimitLastSweep ?? 0) < SWEEP_INTERVAL_MS) return;
   globalForRateLimit.rateLimitLastSweep = now;
@@ -54,9 +88,9 @@ export function rateLimit(key: string, opts: RateLimitOptions): RateLimitResult 
   const now = Date.now();
   maybeSweep(now);
 
-  // Never evict a live bucket to admit a rotating identity.
-  if (!store.has(key) && store.size >= 10_000)
-    return { ok: false, remaining: 0, retryAfterMs: SWEEP_INTERVAL_MS };
+  // A rotating identity can fill the table on its own. Make room from the caller's own
+  // namespace first, so an unrelated tenant is not blocked by someone else's traffic.
+  if (!store.has(key) && store.size >= MAX_KEYS) evictOne(namespaceOf(key));
   const windowStart = now - opts.windowMs;
   const entry = store.get(key);
   const hits = (entry?.hits ?? []).filter((t) => t > windowStart);
