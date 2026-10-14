@@ -1,0 +1,46 @@
+/* Form sizing remains local; records use the shared summary table and action column. */
+.page {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: end;
+}
+
+.form > * {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 2.75rem;
+}
+
+.add {
+  white-space: normal;
+}
+
+.month {
+  display: inline-block;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (min-width: 640px) {
+  .form {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 1024px) {
+  .form {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+  .form > * {
+    min-height: 2.5rem;
+  }
+  .reasonInput {
+    grid-column: span 3;
+  }
+}

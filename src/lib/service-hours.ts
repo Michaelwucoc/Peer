@@ -1,0 +1,111 @@
+/**
+ * Service-hour computation. Pure, dependency-free, and unit-tested — the single source of
+ * truth for how attendance turns into service hours. Always computed server-side at submit
+ * time and stored on the Session row.
+ */
+
+/** The tutor's own status for a session. Anything but TUTOR_ABSENT counts as held. */
+export type SessionTutorStatus = "PRESENT" | "RESCHEDULED" | "EXTRA" | "TUTOR_ABSENT";
+/** A single tutee's attendance at a held session. */
+export type TuteeAttendanceStatus = "PRESENT" | "EXCUSED_ABSENT" | "UNEXCUSED_ABSENT";
+
+/**
+ * Multiplier applied to program-rounded hours, from the split tutor/tutee statuses.
+ * - Tutor absent: 0 — the session didn't happen.
+ * - Held (present / rescheduled / extra) but every tutee excused-absent: 0.
+ * - Otherwise: 1 (prep + the tutor's own time) + the number of PRESENT tutees. Unexcused
+ *   absences don't add to the count but still leave the tutor the baseline credit.
+ */
+export function sessionFactor(
+  tutorStatus: SessionTutorStatus,
+  tuteeStatuses: readonly TuteeAttendanceStatus[],
+): number {
+  if (tutorStatus === "TUTOR_ABSENT") return 0;
+  const present = tuteeStatuses.filter((s) => s === "PRESENT").length;
+  const unexcused = tuteeStatuses.filter((s) => s === "UNEXCUSED_ABSENT").length;
+  if (present === 0 && unexcused === 0) return 0; // everyone excused -> no credit
+  return 1 + present;
+}
+
+/**
+ * Preserved program rounding: a <=10 min remainder within the hour rounds the total
+ * down to a half-hour step; otherwise up. This is NOT nearest-half-hour rounding.
+ * For example, 35 -> 1, 70 -> 1, 71 -> 1.5 hours, before the attendance multiplier.
+ */
+export function roundToHalfHour(durationMin: number): number {
+  const hours = durationMin / 60;
+  const leftover = durationMin % 60;
+  return leftover <= 10 ? Math.floor(hours * 2) / 2 : Math.ceil(hours * 2) / 2;
+}
+
+/**
+ * Applies program rounding to duration first, then multiplies by the attendance factor.
+ */
+export function shCount(durationMin: number, factor: number): number {
+  return roundToHalfHour(durationMin) * factor;
+}
+
+/**
+ * Legacy rounded interview helper, retained for compatibility. Completed interviews
+ * use actual duration / 60 in server/api/routers/interview-management.ts, not this helper.
+ */
+export function interviewServiceHours(durationMin: number): number {
+  return roundToHalfHour(durationMin);
+}
+
+/**
+ * Adjustment calculation constants. Only the meeting deduction is applied automatically by
+ * server/meeting-hours.ts; attendance submission does not apply the session-absence amounts.
+ */
+export const DEDUCTION = {
+  /** Per tutor absence beyond the per-semester limit. */
+  OVER_LIMIT_ABSENCE: 0.25,
+  /** Per unexcused tutor absence from a session. */
+  UNEXCUSED_TUTOR_ABSENCE: 1,
+  /** Per unexcused meeting absence after the first three in a semester. */
+  MISSED_MEETING_UNEXCUSED: 0.25,
+} as const;
+
+/** Threshold used by the calculation helper below, not an attendance-enforced limit. */
+export const ABSENCE_LIMIT_PER_SEMESTER = 3;
+
+/** Deduction for total absences beyond the per-semester limit. */
+export function overLimitAbsenceDeduction(totalAbsences: number): number {
+  const over = Math.max(0, totalAbsences - ABSENCE_LIMIT_PER_SEMESTER);
+  return over * DEDUCTION.OVER_LIMIT_ABSENCE;
+}
+
+/** "YYYY-MM" bucket for a date, used to group monthly totals. */
+export function monthKey(date: Date): string {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+export interface ComputedHours {
+  durationMin: number;
+  shFactor: number;
+  shCount: number;
+  month: string;
+}
+
+/**
+ * Convenience helper used by the attendance mutation: derives every stored field from the
+ * raw submission inputs (the tutor's status + each tutee's attendance).
+ */
+export function computeSessionHours(args: {
+  tutorStatus: SessionTutorStatus;
+  tuteeStatuses: readonly TuteeAttendanceStatus[];
+  startMin: number;
+  endMin: number;
+  date: Date;
+}): ComputedHours {
+  const durationMin = args.endMin - args.startMin;
+  const factor = sessionFactor(args.tutorStatus, args.tuteeStatuses);
+  return {
+    durationMin,
+    shFactor: factor,
+    shCount: shCount(durationMin, factor),
+    month: monthKey(args.date),
+  };
+}

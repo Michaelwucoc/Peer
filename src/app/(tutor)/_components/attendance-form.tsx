@@ -1,0 +1,838 @@
+"use client";
+import { pairingScheduleText } from "~/lib/pairing-schedule";
+import { useDialog } from "~/app/_components/confirm-dialog";
+
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useEffect, useRef, useState } from "react";
+import { useForm } from "react-hook-form";
+import { useTranslations, useTimeZone } from "next-intl";
+import { useRouter } from "next/navigation";
+import { z } from "zod";
+
+import { api } from "~/trpc/react";
+import { hmToMin, minToHm } from "~/lib/time";
+import { useMerge } from "~/app/(tutor)/_components/merge-context";
+import { DisciplineSlots } from "~/app/_components/discipline-slots";
+
+const TUTOR_STATUS_VALUES = [
+  "PRESENT",
+  "RESCHEDULED",
+  "EXTRA",
+  "TUTOR_ABSENT",
+] as const;
+const LIKERT_VALUES = [1, 2, 3, 4, 5] as const;
+const TUTEE_STATUS_VALUES = [
+  "PRESENT",
+  "EXCUSED_ABSENT",
+  "UNEXCUSED_ABSENT",
+] as const;
+
+type TutorStatus = (typeof TUTOR_STATUS_VALUES)[number];
+type TuteeStatus = (typeof TUTEE_STATUS_VALUES)[number];
+
+const RATING_FIELDS = [
+  "ratingPreparedness",
+  "ratingParticipation",
+  "ratingUnderstanding",
+  "ratingBehavior",
+  "ratingProgress",
+] as const;
+
+const ratingField = z.coerce.number().int().min(1).max(5).optional();
+
+const formSchema = z.object({
+  pairingId: z.string().min(1, "Select a pairing"),
+  date: z.string().min(1, "Pick a date"),
+  tutorStatus: z.enum(TUTOR_STATUS_VALUES as unknown as [string, ...string[]]),
+  tutorAbsentReason: z.string().optional(),
+  startTime: z.string().min(1),
+  endTime: z.string().min(1),
+  ratingPreparedness: ratingField,
+  ratingParticipation: ratingField,
+  ratingUnderstanding: ratingField,
+  ratingBehavior: ratingField,
+  ratingProgress: ratingField,
+  comments: z.string().min(1, "Comments are required"),
+});
+
+type FormValues = z.infer<typeof formSchema>;
+
+type CardColor = "" | "YELLOW" | "RED";
+type CardEntry = { color: CardColor; reason: string };
+type TuteeEntry = { status: TuteeStatus; reason: string };
+
+import { programDateKey, programDateTimeInput } from "~/lib/program-time";
+
+export function AttendanceForm() {
+  const t = useTranslations();
+  const timeZone = useTimeZone();
+  const todayIso = () => programDateKey(new Date(), timeZone);
+  const nowHm = () => programDateTimeInput(new Date(), timeZone).slice(11);
+  const router = useRouter();
+  const utils = api.useUtils();
+  const pairingsQuery = api.tutor.myPairings.useQuery();
+  const disciplineQuery = api.tutor.myTuteeDiscipline.useQuery();
+  const roomsQuery = api.tutor.rooms.useQuery();
+  const schedule = api.tutor.schedule.useQuery();
+  const { confirm, dialog } = useDialog();
+  const [refreshFailed, setRefreshFailed] = useState(false);
+  // Native disabled fields update on render. Own submission admission immediately
+  // too, including async form validation and the accepted-write refresh interval.
+  // Server attendance deduplication remains authoritative across clients/retries.
+  const submissionState = useRef<"idle" | "pending" | "saved">("idle");
+  const features = api.program.features.useQuery().data;
+  const refreshSavedTotals = async () => {
+    const results = await Promise.allSettled([
+      // The dashboard total is server-rendered, so there may be no client
+      // observer to invalidate. An explicit fresh read can detect failure.
+      utils.tutor.myMonthlyTotal.fetch(undefined, { staleTime: 0 }),
+      utils.tutor.mySessions.invalidate(
+        undefined,
+        { refetchType: "all" },
+        { throwOnError: true },
+      ),
+    ]);
+    setRefreshFailed(results.some((result) => result.status === "rejected"));
+    // The dashboard's hour total is server-rendered, so replace its stale
+    // server payload while retaining this form's client state and confirmation.
+    router.refresh();
+  };
+  const submit = api.tutor.submitAttendance.useMutation({
+    onSuccess: async () => {
+      submissionState.current = "saved";
+      await refreshSavedTotals();
+    },
+    onError: () => {
+      // A read failure after acceptance must never reopen this write for retry.
+      if (submissionState.current === "pending")
+        submissionState.current = "idle";
+    },
+  });
+
+  // Per-tutee attendance + per-tutee card requests, keyed by tuteeId.
+  const [tuteeState, setTuteeState] = useState<Record<string, TuteeEntry>>({});
+  const [cards, setCards] = useState<Record<string, CardEntry>>({});
+  // Where the session actually ran (defaults to the pairing's room; can be online or another room).
+  const [online, setOnline] = useState(false);
+  const [actualRoomId, setActualRoomId] = useState<string>("");
+  // Which other pairings are merged into this block is chosen under "My pairings" (shared state).
+  const { setPrimaryPairingId, mergeIds, setMergeIds, setAttendanceLocked } =
+    useMerge();
+  useEffect(() => {
+    // The merge checkboxes live in another card but belong to this same save.
+    setAttendanceLocked(submit.isPending || submit.isSuccess);
+    return () => setAttendanceLocked(false);
+  }, [submit.isPending, submit.isSuccess, setAttendanceLocked]);
+  const [formError, setFormError] = useState<string | null>(null);
+  const initializedPairing = useRef<string | null>(null);
+  const initializedMerges = useRef<string[]>([]);
+  const setTutee = (id: string, patch: Partial<TuteeEntry>) =>
+    setTuteeState((s) => ({
+      ...s,
+      [id]: { status: "PRESENT", reason: "", ...s[id], ...patch },
+    }));
+  const setCard = (id: string, patch: Partial<CardEntry>) =>
+    setCards((c) => ({
+      ...c,
+      [id]: { color: "", reason: "", ...c[id], ...patch },
+    }));
+
+  const {
+    register,
+    handleSubmit,
+    watch,
+    setValue,
+    reset,
+    formState: { errors },
+  } = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: { date: todayIso(), tutorStatus: "PRESENT", comments: "" },
+  });
+
+  const selectedPairingId = watch("pairingId");
+  const tutorStatus = watch("tutorStatus") as TutorStatus;
+  const comments = watch("comments");
+  // The always-required fields — gray the submit until they're filled (the rest is
+  // validated on submit with inline messages).
+  const startTime = watch("startTime");
+  const endTime = watch("endTime");
+  const incomplete =
+    !selectedPairingId || !comments?.trim() || !startTime || !endTime;
+  const pairings = pairingsQuery.data ?? [];
+  const selectedPairing = pairings.find((p) => p.id === selectedPairingId);
+  // Tutee attendance is tracked for any held session (present / rescheduled / extra).
+  const held = tutorStatus !== "TUTOR_ABSENT";
+
+  const mergedPairings = pairings.filter(
+    (p) => mergeIds.includes(p.id) && p.id !== selectedPairingId,
+  );
+  // The block's combined roster — the primary plus every merged course, de-duplicated.
+  const unionTutees = selectedPairing
+    ? [
+        ...new Map(
+          [
+            ...selectedPairing.tutees,
+            ...mergedPairings.flatMap((p) => p.tutees),
+          ].map((t) => [t.tuteeId, t]),
+        ).values(),
+      ]
+    : [];
+  // Disciplinary standing per tutee (meter data only — reasons are never sent to tutors).
+  const standingByTutee = new Map(
+    (disciplineQuery.data ?? []).map((d) => [d.tuteeId, d]),
+  );
+
+  // When the primary pairing changes, default the time fields and clear merge/per-tutee state.
+  useEffect(() => {
+    // Tell "My pairings" which pairing is primary so it can offer eligible merges.
+    setPrimaryPairingId(selectedPairingId ?? "");
+    if (!selectedPairing) {
+      initializedPairing.current = null;
+      return;
+    }
+    // A cache refresh can change schedule metadata while a tutor writes notes.
+    // Only choosing a different pairing initializes its attendance draft.
+    if (initializedPairing.current === selectedPairing.id) return;
+    initializedPairing.current = selectedPairing.id;
+    setValue(
+      "startTime",
+      selectedPairing.scheduleConfirmed
+        ? minToHm(selectedPairing.startMin)
+        : "",
+    );
+    setValue(
+      "endTime",
+      selectedPairing.scheduleConfirmed ? minToHm(selectedPairing.endMin) : "",
+    );
+    setOnline(false);
+    setActualRoomId(selectedPairing.room?.id ?? "");
+    setMergeIds([]);
+    setTuteeState(
+      Object.fromEntries(
+        selectedPairing.tutees.map((t) => [
+          t.tuteeId,
+          { status: "PRESENT", reason: "" },
+        ]),
+      ),
+    );
+    setCards({});
+    setFormError(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    selectedPairingId,
+    selectedPairing?.scheduleConfirmed,
+    selectedPairing?.startMin,
+    selectedPairing?.endMin,
+  ]);
+
+  const unscheduledMergeIds = mergedPairings
+    .filter((p) => !p.scheduleConfirmed)
+    .map((p) => p.id)
+    .sort()
+    .join(",");
+  // Only a newly selected unscheduled course clears assumed times. Background
+  // schedule edits must not replace entered times or change a saved receipt.
+  useEffect(() => {
+    const added = mergeIds.filter(
+      (id) => !initializedMerges.current.includes(id),
+    );
+    initializedMerges.current = mergeIds;
+    if (
+      submit.isPending ||
+      submit.isSuccess ||
+      !added.some((id) => unscheduledMergeIds.split(",").includes(id))
+    )
+      return;
+    setValue("startTime", "");
+    setValue("endTime", "");
+  }, [
+    mergeIds,
+    unscheduledMergeIds,
+    submit.isPending,
+    submit.isSuccess,
+    setValue,
+  ]);
+
+  const onSubmit = (values: FormValues) => {
+    if (
+      submissionState.current !== "idle" ||
+      submit.isPending ||
+      submit.isSuccess ||
+      !selectedPairing
+    )
+      return;
+    const status = values.tutorStatus as TutorStatus;
+
+    // Per-tutee attendance across the whole block (default present).
+    const tutees = unionTutees.map((t) => {
+      const entry = tuteeState[t.tuteeId] ?? {
+        status: "PRESENT" as TuteeStatus,
+        reason: "",
+      };
+      return {
+        tuteeId: t.tuteeId,
+        status: entry.status,
+        absenceReason:
+          entry.status === "EXCUSED_ABSENT"
+            ? entry.reason.trim() || undefined
+            : undefined,
+      };
+    });
+
+    // Cross-field validation mirroring the server.
+    if (status === "TUTOR_ABSENT" && !values.tutorAbsentReason?.trim()) {
+      setFormError(t("tutor.attendance.errors.absenceReason"));
+      return;
+    }
+    if (tutees.some((t) => t.status === "EXCUSED_ABSENT" && !t.absenceReason)) {
+      setFormError(t("tutor.attendance.errors.excusedReason"));
+      return;
+    }
+    const sessionHeld =
+      status !== "TUTOR_ABSENT" && tutees.some((t) => t.status === "PRESENT");
+    if (
+      sessionHeld &&
+      [
+        values.ratingPreparedness,
+        values.ratingParticipation,
+        values.ratingUnderstanding,
+        values.ratingBehavior,
+        values.ratingProgress,
+      ].some((r) => r == null)
+    ) {
+      setFormError(t("tutor.attendance.errors.ratingsRequired"));
+      return;
+    }
+
+    const unionIds = new Set(unionTutees.map((t) => t.tuteeId));
+    const cardList = Object.entries(cards)
+      .filter(
+        ([id, c]) =>
+          unionIds.has(id) && (c.color === "YELLOW" || c.color === "RED"),
+      )
+      .map(([tuteeId, c]) => ({
+        tuteeId,
+        color: c.color as "YELLOW" | "RED",
+        reason: c.reason.trim(),
+      }));
+    if (cardList.some((c) => !c.reason)) {
+      setFormError(t("tutor.attendance.errors.cardReason"));
+      return;
+    }
+    setFormError(null);
+
+    submissionState.current = "pending";
+    submit.mutate({
+      pairingId: values.pairingId,
+      mergePairingIds: mergeIds.length > 0 ? mergeIds : undefined,
+      date: new Date(values.date),
+      tutorStatus: status,
+      tutorAbsentReason:
+        status === "TUTOR_ABSENT"
+          ? values.tutorAbsentReason?.trim()
+          : undefined,
+      tutees,
+      startMin: hmToMin(values.startTime),
+      endMin: hmToMin(values.endTime),
+      ratingPreparedness: values.ratingPreparedness,
+      ratingParticipation: values.ratingParticipation,
+      ratingUnderstanding: values.ratingUnderstanding,
+      ratingBehavior: values.ratingBehavior,
+      ratingProgress: values.ratingProgress,
+      comments: values.comments.trim(),
+      actualRoomId: online ? null : actualRoomId || null,
+      online,
+      cards: cardList.length > 0 ? cardList : undefined,
+    });
+  };
+
+  if (pairingsQuery.isLoading)
+    return <p className="muted">{t("tutor.attendance.loading")}</p>;
+  if (pairingsQuery.error && !pairingsQuery.data)
+    return (
+      <div role="alert">
+        <p>{pairingsQuery.error.message}</p>
+        <button
+          className="btn-secondary btn-sm"
+          onClick={() => void pairingsQuery.refetch()}
+        >
+          {t("tutor.tasks.retry")}
+        </button>
+      </div>
+    );
+  if (pairings.length === 0) {
+    return <p className="muted">{t("tutor.attendance.noPairings")}</p>;
+  }
+
+  return (
+    <form onSubmit={handleSubmit(onSubmit)}>
+      {/* Freeze the submitted fields. Keep a successful receipt until an explicit
+          new-entry action, preventing a second click from duplicating attendance. */}
+      <fieldset
+        disabled={submit.isPending || submit.isSuccess}
+        aria-busy={submit.isPending}
+        className="min-w-0 space-y-6"
+      >
+        {[pairingsQuery, roomsQuery, schedule].some((query) => query.error) && (
+          <div role="alert" className="text-sm text-red-700">
+            <p>{t("tutor.tasks.loadError")}</p>
+            <button
+              type="button"
+              className="btn-secondary btn-sm"
+              onClick={() => {
+                for (const query of [pairingsQuery, roomsQuery, schedule])
+                  if (query.error) void query.refetch();
+              }}
+            >
+              {t("tutor.tasks.retry")}
+            </button>
+          </div>
+        )}
+        {/* Pairing */}
+        <div className="space-y-1">
+          <label className="label" htmlFor="attendance-pairing">
+            {t("tutor.attendance.pairing")}
+          </label>
+          <select
+            {...register("pairingId")}
+            id="attendance-pairing"
+            className="select"
+            defaultValue=""
+          >
+            <option value="" disabled>
+              {t("tutor.attendance.selectPairing")}
+            </option>
+            {pairings.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.subject} · {pairingScheduleText(p, t("scheduling.awaiting"))}
+                {p.room ? ` · ${p.room.name}` : ""}
+              </option>
+            ))}
+          </select>
+          {errors.pairingId && (
+            <p className="text-sm text-red-600">{errors.pairingId.message}</p>
+          )}
+        </div>
+
+        {/* Merging several sessions into one block is chosen under "My pairings". */}
+        {mergedPairings.length > 0 && (
+          <p className="muted text-xs">
+            {t("tutor.attendance.mergedCount", {
+              count: mergedPairings.length,
+            })}
+          </p>
+        )}
+
+        {/* Date + tutor status */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-date">
+              {t("tutor.attendance.date")}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <input
+                id="attendance-date"
+                type="date"
+                {...register("date")}
+                max={todayIso()}
+                className="input min-w-0 flex-1"
+              />
+              <button
+                type="button"
+                className="btn-secondary btn-sm shrink-0"
+                onClick={() => setValue("date", todayIso())}
+              >
+                {t("tutor.attendance.today")}
+              </button>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-tutor-status">
+              {t("tutor.attendance.tutorStatus")}
+            </label>
+            <select
+              {...register("tutorStatus")}
+              id="attendance-tutor-status"
+              className="select"
+            >
+              {TUTOR_STATUS_VALUES.map((s) => (
+                <option key={s} value={s}>
+                  {t(`tutor.attendance.tutorStatusOpt.${s}`)}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Tutor absence reason */}
+        {tutorStatus === "TUTOR_ABSENT" && (
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-tutor-absence-reason">
+              {t("tutor.attendance.tutorAbsentReason")}
+            </label>
+            <input
+              {...register("tutorAbsentReason")}
+              id="attendance-tutor-absence-reason"
+              className="input"
+            />
+          </div>
+        )}
+
+        {selectedPairing &&
+          (!selectedPairing.scheduleConfirmed || unscheduledMergeIds) && (
+            <p className="muted text-sm">
+              {t("scheduling.actualTimesRequired")}
+            </p>
+          )}
+        {/* Time (with "now") */}
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-start-time">
+              {t("tutor.attendance.start")}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <input
+                id="attendance-start-time"
+                type="time"
+                {...register("startTime")}
+                className="input min-w-0 flex-1"
+              />
+              <button
+                type="button"
+                className="btn-secondary btn-sm shrink-0"
+                onClick={() => setValue("startTime", nowHm())}
+              >
+                {t("tutor.attendance.now")}
+              </button>
+            </div>
+          </div>
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-end-time">
+              {t("tutor.attendance.end")}
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <input
+                id="attendance-end-time"
+                type="time"
+                {...register("endTime")}
+                className="input min-w-0 flex-1"
+              />
+              <button
+                type="button"
+                className="btn-secondary btn-sm shrink-0"
+                onClick={() => setValue("endTime", nowHm())}
+              >
+                {t("tutor.attendance.now")}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {dialog}
+        {/* Where the session ran — the room used (or online). Lets the crew validate attendance. */}
+        {selectedPairing && held && (
+          <div className="space-y-1">
+            <label className="label" htmlFor="attendance-room-used">
+              {t("tutor.attendance.roomUsed")}
+            </label>
+            <div className="flex flex-wrap items-center gap-3">
+              <select
+                id="attendance-room-used"
+                value={actualRoomId}
+                onChange={async (e) => {
+                  const roomId = e.target.value;
+                  const day = new Date(watch("date")).getUTCDay() || 7;
+                  const occupied =
+                    !!schedule.data?.pairings.some(
+                      (p) =>
+                        p.id !== selectedPairing.id &&
+                        !mergeIds.includes(p.id) &&
+                        p.roomId === roomId &&
+                        p.dayOfWeek === day &&
+                        p.startMin < hmToMin(endTime || "00:00") &&
+                        p.endMin > hmToMin(startTime || "24:00"),
+                    ) ||
+                    schedule.data?.blocks.some(
+                      (b) =>
+                        b.roomId === roomId &&
+                        b.dayOfWeek === day &&
+                        b.startMin < hmToMin(endTime || "00:00") &&
+                        b.endMin > hmToMin(startTime || "24:00"),
+                    );
+                  if (
+                    occupied &&
+                    !(await confirm({
+                      title: t("workflows.roomWarning"),
+                      message: t("workflows.roomWarningBody"),
+                      confirmLabel: t("workflows.reportActual"),
+                      cancelLabel: t("workflows.cancel"),
+                    }))
+                  )
+                    return;
+                  setActualRoomId(roomId);
+                }}
+                disabled={online || !schedule.data}
+                className="select field-auto min-w-44"
+              >
+                <option value="">{t("tutor.attendance.roomUnset")}</option>
+                {(roomsQuery.data ?? []).map((rm) => (
+                  <option key={rm.id} value={rm.id}>
+                    {rm.name}
+                  </option>
+                ))}
+              </select>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={online}
+                  onChange={(e) => setOnline(e.target.checked)}
+                  className="accent-accent-600"
+                />
+                <span>{t("tutor.attendance.online")}</span>
+              </label>
+            </div>
+            <p className="muted text-xs">{t("tutor.attendance.roomHelp")}</p>
+          </div>
+        )}
+
+        {/* Per-tutee attendance (only when the tutor held the session) */}
+        {selectedPairing && held && (
+          <fieldset>
+            <legend className="label">
+              {t("tutor.attendance.tuteeAttendance")}
+            </legend>
+            <div className="mt-1 space-y-2">
+              {unionTutees.map((t2) => {
+                const entry = tuteeState[t2.tuteeId];
+                const status = entry?.status ?? "PRESENT";
+                const standing = standingByTutee.get(t2.tuteeId);
+                return (
+                  <div
+                    key={t2.tuteeId}
+                    className="grid gap-2 rounded-md border border-slate-100 bg-slate-50/60 p-2 sm:flex sm:flex-wrap sm:items-center sm:border-0 sm:bg-transparent sm:p-0"
+                  >
+                    <span className="min-w-0 truncate text-sm text-slate-700 sm:w-40">
+                      {t2.tutee.englishName}
+                    </span>
+                    {/* Card standing at a glance — meter only, no reasons. */}
+                    {standing && (
+                      <span
+                        className="flex items-center gap-1"
+                        title={
+                          standing.removalPending
+                            ? t("tutor.discipline.removalPending")
+                            : t("tutor.discipline.standingTitle", {
+                                red: standing.validRed,
+                                yellow: standing.validYellow,
+                              })
+                        }
+                      >
+                        <DisciplineSlots
+                          validRed={standing.validRed}
+                          validYellow={standing.validYellow}
+                          size="sm"
+                        />
+                        {standing.removalPending && (
+                          <span className="badge-red">
+                            {t("tutor.discipline.removalBadge")}
+                          </span>
+                        )}
+                      </span>
+                    )}
+                    <select
+                      aria-label={`${t2.tutee.englishName} ${t("tutor.attendance.tuteeAttendance")}`}
+                      className="select sm:field-auto min-w-0 sm:min-w-40"
+                      value={status}
+                      onChange={(e) =>
+                        setTutee(t2.tuteeId, {
+                          status: e.target.value as TuteeStatus,
+                        })
+                      }
+                    >
+                      {TUTEE_STATUS_VALUES.map((s) => (
+                        <option key={s} value={s}>
+                          {t(`tutor.attendance.tuteeStatusOpt.${s}`)}
+                        </option>
+                      ))}
+                    </select>
+                    {status === "EXCUSED_ABSENT" && (
+                      <input
+                        className="input min-w-0 flex-1"
+                        placeholder={t("tutor.attendance.reasonRequired")}
+                        value={entry?.reason ?? ""}
+                        onChange={(e) =>
+                          setTutee(t2.tuteeId, { reason: e.target.value })
+                        }
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </fieldset>
+        )}
+
+        {/* Ratings (required when a session was held) — likert scales */}
+        {held && (
+          <fieldset className="space-y-3">
+            <legend className="label">{t("tutor.attendance.ratings")}</legend>
+            {RATING_FIELDS.map((name) => (
+              <div key={name}>
+                <p className="text-xs font-medium text-slate-600">
+                  {t(`tutor.attendance.rating.${name}`)}
+                </p>
+                <div className="mt-1 grid grid-cols-5 gap-1">
+                  {/* The label provides the touch target; native radio artwork stays compact. */}
+                  {LIKERT_VALUES.map((value) => (
+                    <label
+                      key={value}
+                      title={t(`tutor.attendance.likert.${value}`)}
+                      className="has-[:checked]:border-accent-500 has-[:checked]:bg-accent-50 has-[:checked]:text-accent-700 flex min-h-11 cursor-pointer items-center justify-center gap-1 rounded-md border border-slate-200 px-2 py-1 text-sm text-slate-600 lg:min-h-8"
+                    >
+                      <input
+                        type="radio"
+                        value={value}
+                        {...register(name)}
+                        aria-label={`${t(`tutor.attendance.rating.${name}`)}: ${value} · ${t(`tutor.attendance.likert.${value}`)}`}
+                        className="accent-accent-600"
+                      />
+                      {value}
+                    </label>
+                  ))}
+                </div>
+                <p className="muted mt-1 text-xs">
+                  1 · {t("tutor.attendance.likert.1")} — 5 ·{" "}
+                  {t("tutor.attendance.likert.5")}
+                </p>
+              </div>
+            ))}
+          </fieldset>
+        )}
+
+        {/* Comments (required) */}
+        <div className="space-y-1">
+          <label className="label" htmlFor="attendance-comments">
+            {t("tutor.attendance.comments")}
+          </label>
+          <textarea
+            {...register("comments")}
+            id="attendance-comments"
+            rows={3}
+            className="textarea"
+          />
+          {errors.comments && (
+            <p className="text-sm text-red-600">{errors.comments.message}</p>
+          )}
+        </div>
+
+        {/* Disciplinary cards (optional; hidden when the discipline module is off) */}
+        {selectedPairing && held && features?.DISCIPLINE && (
+          <fieldset className="rounded-lg border border-slate-200 p-3">
+            <legend className="label px-1">
+              {t("tutor.attendance.cardsTitle")}
+            </legend>
+            <p className="muted mb-2 text-xs">
+              {t("tutor.attendance.cardsHelp")}
+            </p>
+            <div className="space-y-2">
+              {unionTutees.map((t2) => {
+                const color = cards[t2.tuteeId]?.color ?? "";
+                return (
+                  <div
+                    key={t2.tuteeId}
+                    className="grid gap-2 rounded-md border border-slate-100 bg-slate-50/60 p-2 sm:flex sm:flex-wrap sm:items-center sm:border-0 sm:bg-transparent sm:p-0"
+                  >
+                    <span className="min-w-0 truncate text-sm text-slate-700 sm:w-40">
+                      {t2.tutee.englishName}
+                    </span>
+                    <select
+                      aria-label={`${t2.tutee.englishName} ${t("tutor.attendance.cardsTitle")}`}
+                      className="select sm:field-auto min-w-0 sm:min-w-32"
+                      value={color}
+                      onChange={(e) =>
+                        setCard(t2.tuteeId, {
+                          color: e.target.value as CardColor,
+                        })
+                      }
+                    >
+                      <option value="">{t("tutor.attendance.noCard")}</option>
+                      <option value="YELLOW">
+                        🟨 {t("tutor.attendance.yellow")}
+                      </option>
+                      <option value="RED">
+                        🟥 {t("tutor.attendance.red")}
+                      </option>
+                    </select>
+                    {(color === "YELLOW" || color === "RED") && (
+                      <input
+                        className="input min-w-0 flex-1"
+                        placeholder={t("tutor.attendance.reasonRequired")}
+                        value={cards[t2.tuteeId]?.reason ?? ""}
+                        onChange={(e) =>
+                          setCard(t2.tuteeId, { reason: e.target.value })
+                        }
+                      />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </fieldset>
+        )}
+
+        <div className="flex flex-wrap items-center justify-center gap-3 sm:justify-start">
+          <button
+            type="submit"
+            disabled={submit.isPending || incomplete}
+            className="btn-primary"
+          >
+            {submit.isPending
+              ? t("tutor.attendance.submitting")
+              : t("tutor.attendance.submit")}
+          </button>
+          {submit.isSuccess && (
+            <span role="status" className="text-sm text-green-600">
+              {t("tutor.attendance.saved")}
+            </span>
+          )}
+          {(formError ?? submit.error) && (
+            <span role="alert" className="text-sm text-red-600">
+              {formError ?? submit.error?.message}
+            </span>
+          )}
+        </div>
+      </fieldset>
+      {refreshFailed && (
+        <p role="alert" className="mt-3 text-sm text-amber-800">
+          {t("tutor.tasks.savedRefreshError")}{" "}
+          <button
+            type="button"
+            className="btn-secondary btn-sm"
+            onClick={() => void refreshSavedTotals()}
+          >
+            {t("tutor.tasks.retry")}
+          </button>
+        </p>
+      )}
+
+      {submit.isSuccess && (
+        <button
+          type="button"
+          onClick={() => {
+            submissionState.current = "idle";
+            reset();
+            setTuteeState({});
+            setCards({});
+            setMergeIds([]);
+            setFormError(null);
+            submit.reset();
+            setRefreshFailed(false);
+          }}
+          className="btn-secondary mt-3"
+        >
+          {t("tutor.attendance.submitAnother")}
+        </button>
+      )}
+    </form>
+  );
+}

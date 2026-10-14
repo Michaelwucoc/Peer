@@ -1,0 +1,538 @@
+import { captchaAction } from "~/lib/captcha";
+import { captchaStatus, publicCaptcha, verifySignupCaptcha } from "~/server/captcha";
+import { aliyunProvider } from "~/server/captcha/aliyun";
+import { withSignupAdmission } from "~/server/signup-admission";
+import { TRPCError } from "@trpc/server";
+import { z } from "zod";
+
+import {
+  createTRPCRouter,
+  publicProcedure,
+  adminProcedure,
+  adminOnlyProcedure,
+  headProcedure,
+} from "~/server/api/trpc";
+import {
+  getFeatures,
+  FEATURE_KEYS,
+  DEFAULT_FEATURES,
+} from "~/server/program/features";
+import { recordAudit } from "~/server/audit/log";
+import { isEmailDeliveryAvailable } from "~/server/email/sender";
+import { getEmailDeliveryStatus } from "~/server/email/delivery-status";
+import { resendStuckEmails } from "~/server/email/resend-stuck";
+
+import { getProgramTimeZone } from "~/server/program/time-zone";
+import { isProgramTimeZone } from "~/lib/program-time";
+import { programTimeZoneOptions } from "~/lib/program-time-zone-options";
+import { inTransaction, lockEntity } from "~/server/transactions";
+
+import {
+  SIGNUP_FIELDS,
+  signupFormSchema,
+  fieldStateSchema,
+} from "~/lib/signup-fields";
+import { getSignupSettings } from "~/server/program/signup-fields";
+import { profilePolicySchema } from "~/lib/profile-policy";
+import { getProfilePolicy } from "~/server/program/profile-policy";
+import { lockUsernameNamespace } from "~/server/auth/username";
+
+const featureKey = z.enum([
+  "CREW",
+  "DISCIPLINE",
+  "MEETINGS",
+  "INTERVIEWS",
+  "SERVICE_HOURS",
+  "QUARTER_SYSTEM",
+  "VIEWER_SIGNUP",
+  "EMAIL_2FA",
+]);
+
+const httpUrl = z
+  .string()
+  .trim()
+  .url()
+  .max(2_048)
+  .refine((value) => ["http:", "https:"].includes(new URL(value).protocol), {
+    message: "Preview link must use http:// or https://.",
+  });
+
+/**
+ * Program configuration: the optional-module feature flags. Effective flags are public (any surface
+ * can hide a disabled module); staging changes is HEAD-only and takes effect at the next refresh.
+ */
+export const programRouter = createTRPCRouter({
+  captchaPublic: publicProcedure.query(({ ctx }) =>
+    withSignupAdmission(ctx.db, ctx.headers, "read", undefined, () =>
+      publicCaptcha(ctx.db),
+    ),
+  ),
+  verifySignupCaptcha: publicProcedure
+    .input(
+      z.object({
+        action: captchaAction,
+        email: z.string().trim().email().max(254),
+        proof: z.string().min(1).max(16_384),
+      }),
+    )
+    .mutation(({ ctx, input }) =>
+      verifySignupCaptcha(ctx.db, ctx.headers, input),
+    ),
+  captchaSettings: adminProcedure.query(async ({ ctx }) => ({
+    ...(await captchaStatus(ctx.db)),
+    ready: !!aliyunProvider(),
+    canEdit: ["ADMIN", "HEAD"].includes(ctx.session.role),
+    canApply: ctx.session.role === "HEAD",
+  })),
+  setCaptcha: adminOnlyProcedure
+    .input(
+      z
+        .object({
+          enabled: z.boolean(),
+          expectedVersion: z.number().int().nonnegative(),
+        })
+        .strict(),
+    )
+    .mutation(({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        await lockEntity(tx, "program:captcha");
+        const before = await captchaStatus(tx);
+        if (before.version !== input.expectedVersion)
+          throw new TRPCError({ code: "CONFLICT", message: "CAPTCHA_CHANGED" });
+        // Local validation only. Disabling never calls or depends on provider availability.
+        if (input.enabled && !aliyunProvider())
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "CAPTCHA_CONFIG",
+          });
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: {
+            id: "program",
+            captchaEnabled: input.enabled,
+            captchaVersion: 1,
+          },
+          update: {
+            captchaEnabled: input.enabled,
+            captchaVersion: { increment: 1 },
+          },
+        });
+        await tx.auditLog.create({
+          data: {
+            userId: ctx.session.user.id,
+            userName: ctx.session.user.name,
+            entity: "ProgramSettings",
+            entityId: "program",
+            operation: "program.setCaptcha",
+            action: "Changed public signup CAPTCHA verification",
+            details: {
+              before,
+              after: { enabled: input.enabled, version: before.version + 1 },
+            },
+          },
+        });
+        return { enabled: input.enabled, version: before.version + 1 };
+      }),
+    ),
+  profilePolicy: publicProcedure.query(async ({ ctx }) => ({
+    ...(await getProfilePolicy(ctx.db)),
+    currentSchoolYear: (await ctx.db.term.findFirst({ where: { active: true }, select: { schoolYear: true } }))?.schoolYear ?? null,
+  })),
+  profilePolicySettings: adminProcedure.query(async ({ ctx }) => ({
+    ...(await getProfilePolicy(ctx.db)),
+    canEdit: ctx.session.role === "HEAD" || ctx.session.role === "ADMIN",
+    canApply: ctx.session.role === "HEAD",
+  })),
+  setProfilePolicy: adminOnlyProcedure
+    .input(profilePolicySchema.extend({ expectedPolicy: profilePolicySchema }))
+    .mutation(({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        // Compare the complete policy under one lock so stale admin tabs cannot overwrite it.
+        await lockEntity(tx, "program:profile-policy");
+        const before = await getProfilePolicy(tx);
+        if (JSON.stringify(before) !== JSON.stringify(input.expectedPolicy))
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "PROFILE_POLICY_CHANGED",
+          });
+        const after = {
+          requireLatinNames: true,
+          requireLatinLegalNames: false,
+          usePreferredNames: input.usePreferredNames,
+          showAlternateNames: input.showAlternateNames,
+          offeredGrades: input.offeredGrades,
+        };
+        // Fence current identity writers before refreshing their materialized labels. Take
+        // table locks before changing settings, so readers never observe a partial refresh.
+        await lockUsernameNamespace(tx);
+        // EXCLUSIVE also fences SELECT FOR UPDATE profile locks. Registration holds the
+        // namespace lock before touching Tutor/User, matching this order.
+        await tx.$executeRaw`LOCK TABLE "User", "Tutor", "Tutee" IN EXCLUSIVE MODE`;
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: { id: "program", ...after },
+          update: after,
+        });
+        await tx.auditLog.create({
+          data: {
+            userId: ctx.session.user.id,
+            userName: ctx.session.user.name,
+            entity: "ProgramSettings",
+            entityId: "program",
+            operation: "program.setProfilePolicy",
+            action: "Changed name display and grade settings",
+            details: { before, after, existingRecordsPreserved: true },
+          },
+        });
+        return after;
+      }),
+    ),
+  // Editing means proposing for Admin, applying for Head; Coordinator reads remain read-only.
+  signupFieldSettings: adminProcedure.query(async ({ ctx }) => ({
+    fields: await getSignupSettings(ctx.db),
+    canEdit: ["ADMIN", "HEAD"].includes(ctx.session.role),
+    canApply: ctx.session.role === "HEAD",
+    secondaryEmailBindingEnabled:
+      (await ctx.db.programSettings.findUnique({ where: { id: "program" } }))
+        ?.secondaryEmailBindingEnabled ?? true,
+  })),
+  setSignupField: headProcedure
+    .input(
+      z
+        .object({
+          form: signupFormSchema,
+          field: z.string(),
+          state: fieldStateSchema,
+          expectedState: fieldStateSchema,
+        })
+        .strict(),
+    )
+    .mutation(async ({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        const field = SIGNUP_FIELDS[input.form].find(
+          (field) => field.key === input.field,
+        );
+        if (!field || field.locked)
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "This field is locked or does not exist.",
+          });
+        await lockEntity(tx, "signup-fields");
+        const fields = await getSignupSettings(tx);
+        const before = fields[input.form][input.field];
+        if (before !== input.expectedState)
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "The field changed. Reload settings and try again.",
+          });
+        fields[input.form][input.field] = input.state;
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: { id: "program", signupFields: fields },
+          update: { signupFields: fields },
+        });
+        await tx.auditLog.create({
+          data: {
+            userId: ctx.session.user.id,
+            userName: ctx.session.user.name,
+            entity: "ProgramSettings",
+            entityId: "program",
+            operation: "program.setSignupField",
+            action: "Changed signup field",
+            details: { ...input, before, existingSubmissionsPreserved: true },
+          },
+        });
+        return { ok: true };
+      }),
+    ),
+  // Separate diagnostics keep slow SMTP authentication out of immediate settings reads.
+  emailDeliveryStatus: adminProcedure.query(({ ctx }) =>
+    getEmailDeliveryStatus(ctx.db),
+  ),
+  resendStuckEmails: adminOnlyProcedure.mutation(({ ctx }) =>
+    resendStuckEmails(ctx.db, ctx.session.user),
+  ),
+  emailNotificationSettings: adminProcedure.query(async ({ ctx }) => {
+    const settings = await ctx.db.programSettings.findUnique({
+      where: { id: "program" },
+    });
+    const failed = await ctx.db.emailDelivery.count({
+      where: { status: "FAILED" },
+    });
+    return {
+      enabled: settings?.emailNotificationsEnabled ?? false,
+      secondaryEmailBindingEnabled:
+        settings?.secondaryEmailBindingEnabled ?? true,
+      canEdit: ["HEAD", "ADMIN"].includes(ctx.session.role),
+      canApply: ctx.session.role === "HEAD",
+      deliveryAvailable: isEmailDeliveryAvailable("PROGRAM"),
+      failed,
+    };
+  }),
+  setEmailNotifications: adminOnlyProcedure
+    .input(z.object({ enabled: z.boolean(), expectedEnabled: z.boolean() }))
+    .mutation(async ({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        await lockEntity(tx, "email-notifications-setting");
+        const settings = await tx.programSettings.findUnique({
+          where: { id: "program" },
+        });
+        if (
+          (settings?.emailNotificationsEnabled ?? false) !==
+          input.expectedEnabled
+        )
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "The setting changed. Reload and try again.",
+          });
+        if (input.enabled && !isEmailDeliveryAvailable("PROGRAM"))
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "Configure email delivery before enabling notifications.",
+          });
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: { id: "program", emailNotificationsEnabled: input.enabled },
+          update: { emailNotificationsEnabled: input.enabled },
+        });
+        // Drop only optional backlog on disable; mandatory security alerts must still be delivered.
+        if (!input.enabled)
+          await tx.emailDelivery.updateMany({
+            where: { status: "PENDING", category: { not: "security" } },
+            data: { status: "SKIPPED", completedAt: new Date() },
+          });
+        return { ok: true };
+      }),
+    ),
+  // Independent immediate availability setting; never a coordinator proposal.
+  setSecondaryEmailBinding: adminOnlyProcedure
+    .input(z.object({ enabled: z.boolean(), expectedEnabled: z.boolean() }))
+    .mutation(async ({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        await lockEntity(tx, "secondary-email-binding-setting");
+        const settings = await tx.programSettings.findUnique({
+          where: { id: "program" },
+        });
+        if (
+          (settings?.secondaryEmailBindingEnabled ?? true) !==
+          input.expectedEnabled
+        )
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "The setting changed. Reload and try again.",
+          });
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: {
+            id: "program",
+            secondaryEmailBindingEnabled: input.enabled,
+          },
+          update: { secondaryEmailBindingEnabled: input.enabled },
+        });
+        // Disabling preserves owned addresses, pending state and all authentication flows.
+        return { ok: true };
+      }),
+    ),
+  timeZoneSettings: adminProcedure.query(async ({ ctx }) => {
+    const timeZone = await getProgramTimeZone(ctx.db);
+    return {
+      timeZone,
+      timeZoneOptions: programTimeZoneOptions(timeZone),
+      canEdit: ctx.session.role === "HEAD" || ctx.session.role === "ADMIN",
+      canApply: ctx.session.role === "HEAD",
+    };
+  }),
+  // Central authority queues Admin proposals; only Head applies significant settings.
+  setTimeZone: adminOnlyProcedure
+    .input(
+      z.object({
+        timeZone: z
+          .string()
+          .max(100)
+          .refine(isProgramTimeZone, "Choose a valid IANA time zone."),
+        expectedTimeZone: z.string(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) =>
+      inTransaction(ctx.db, async (tx) => {
+        await lockEntity(tx, "program-timezone");
+        const previous = await getProgramTimeZone(tx);
+        if (previous !== input.expectedTimeZone)
+          throw new TRPCError({
+            code: "CONFLICT",
+            message:
+              "The program time zone changed. Reload and review the latest setting.",
+          });
+        if (previous === input.timeZone) return { timeZone: previous };
+        await tx.programSettings.upsert({
+          where: { id: "program" },
+          create: { id: "program", timeZone: input.timeZone },
+          update: { timeZone: input.timeZone },
+        });
+        await tx.auditLog.create({
+          data: {
+            userId: ctx.session.user.id,
+            userName: ctx.session.user.name,
+            entity: "ProgramSettings",
+            entityId: "program",
+            operation: "program.setTimeZone",
+            action: "Changed program time zone",
+            details: {
+              before: previous,
+              after: input.timeZone,
+              weeklyClockTimesPreserved: true,
+              storedTimestampsPreserved: true,
+            },
+          },
+        });
+        return { timeZone: input.timeZone };
+      }),
+    ),
+  /** Effective on/off for every optional module (missing row = on). Public so the landing page and
+   *  public signup forms can hide a disabled module. */
+  features: publicProcedure.query(async ({ ctx }) => ({
+    ...(await getFeatures(ctx.db)),
+    EMAIL_DELIVERY_AVAILABLE: isEmailDeliveryAvailable("SECURITY"),
+  })),
+
+  /** Immediate, independent intake settings; serialize with submissions and period refresh. */
+  setSignupWindow: adminOnlyProcedure
+    .input(
+      z
+        .object({
+          audience: z.enum(["tutor", "tutee"]).default("tutee"),
+          expectedTermId: z.string().optional(),
+          enabled: z.boolean().optional(),
+          opensAt: z.date().nullable(),
+          closesAt: z.date().nullable().optional(),
+          previewUrl: httpUrl.nullable(),
+        })
+        .superRefine((value, ctx) => {
+          if (
+            value.opensAt &&
+            value.closesAt &&
+            value.closesAt <= value.opensAt
+          )
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ["closesAt"],
+              message: "Closing time must be after opening time.",
+            });
+        }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const updated = await inTransaction(ctx.db, async (tx) => {
+        await lockEntity(tx, "program:period");
+        const active = await tx.term.findFirst({
+          where: { active: true },
+          orderBy: { createdAt: "desc" },
+        });
+        if (!active)
+          throw new TRPCError({
+            code: "PRECONDITION_FAILED",
+            message: "Create an active program period first.",
+          });
+        if (input.expectedTermId && active.id !== input.expectedTermId)
+          throw new TRPCError({
+            code: "CONFLICT",
+            message: "The program period changed. Reload before saving.",
+          });
+        const tutor = input.audience === "tutor";
+        const closesAt =
+          input.closesAt === undefined
+            ? tutor
+              ? active.tutorSignupClosesAt
+              : active.signupClosesAt
+            : input.closesAt;
+        if (input.opensAt && closesAt && closesAt <= input.opensAt)
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Closing time must be after opening time.",
+          });
+        return tx.term.update({
+          where: { id: active.id },
+          data: tutor
+            ? {
+                tutorSignupEnabled: input.enabled,
+                tutorSignupOpensAt: input.opensAt,
+                tutorSignupClosesAt: input.closesAt,
+                tutorSignupPreviewUrl: input.previewUrl,
+              }
+            : {
+                signupEnabled: input.enabled,
+                signupOpensAt: input.opensAt,
+                signupClosesAt: input.closesAt,
+                signupPreviewUrl: input.previewUrl,
+              },
+        });
+      });
+      await recordAudit({
+        userId: ctx.session.user.id,
+        userName: ctx.session.user.name,
+        action: `Updated ${input.audience} recruitment window`,
+        entity: "Term",
+        entityId: updated.id,
+      });
+      return updated;
+    }),
+
+  /** Current + staged (pending) state for the Program UI, plus whether the caller may edit (HEAD). */
+  featureSettings: adminProcedure.query(async ({ ctx }) => {
+    const rows = await ctx.db.programFeature.findMany();
+    const byKey = new Map(rows.map((r) => [r.key, r]));
+    return {
+      canEdit: ["ADMIN", "HEAD"].includes(ctx.session.role),
+      canApply: ctx.session.role === "HEAD",
+      features: FEATURE_KEYS.map((key) => {
+        const row = byKey.get(key);
+        return {
+          key,
+          enabled: row?.enabled ?? DEFAULT_FEATURES[key],
+          pending: row?.pendingEnabled ?? null,
+        };
+      }),
+    };
+  }),
+
+  /** Stage a feature change (HEAD only). It activates at the next program refresh. Setting the
+   *  target back to the current effective value clears any pending change. */
+  setFeaturePending: headProcedure
+    .input(z.object({ key: featureKey, enabled: z.boolean() }))
+    .mutation(async ({ ctx, input }) => {
+      if (
+        input.key === "EMAIL_2FA" &&
+        input.enabled &&
+        !isEmailDeliveryAvailable("SECURITY")
+      ) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            "Configure SMTP before enabling email two-factor authentication.",
+        });
+      }
+      const existing = await ctx.db.programFeature.findUnique({
+        where: { key: input.key },
+        select: { enabled: true },
+      });
+      const current = existing?.enabled ?? DEFAULT_FEATURES[input.key];
+      const pendingEnabled = input.enabled === current ? null : input.enabled;
+      await ctx.db.programFeature.upsert({
+        where: { key: input.key },
+        update: { pendingEnabled, updatedByName: ctx.session.user.name },
+        create: {
+          key: input.key,
+          enabled: current,
+          pendingEnabled,
+          updatedByName: ctx.session.user.name,
+        },
+      });
+      await recordAudit({
+        userId: ctx.session.user.id,
+        userName: ctx.session.user.name,
+        action: `Staged ${input.key} ${input.enabled ? "on" : "off"} for next refresh`,
+        entity: "ProgramFeature",
+        entityId: input.key,
+      });
+      return { ok: true };
+    }),
+});

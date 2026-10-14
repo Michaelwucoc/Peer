@@ -1,0 +1,189 @@
+import { db } from "~/server/db";
+import { deferUntilCommit } from "~/server/db-scope";
+import { emailSender, isEmailDeliveryAvailable } from "./sender";
+import { emailUrl, notificationDestination } from "./urls";
+import { notificationUnsubscribeUrl } from "./unsubscribe-token";
+
+const descriptions: Record<string, string> = {
+  primary_changed: "Your primary account email changed",
+  secondary_added: "A secondary email was verified on your account",
+  secondary_removed: "A secondary email was removed from your account",
+  security_changed: "Your account security settings changed",
+  information_changed: "Your account information changed",
+  message_received: "You have a new private message",
+  program_update: "You have a new program notification",
+};
+
+/** Leased batches survive restarts and SKIP LOCKED keeps concurrent application workers independent.
+ * SMTP has no exactly-once guarantee: a crash after acceptance may retry, but ordinary concurrent
+ * dispatches cannot send the same row. A stable Message-ID further identifies retries. */
+export async function deliverNotifications(limit = 10) {
+  // Defer the entire lease/send/status workflow, otherwise a deferred SMTP call would
+  // mark an outbox row SENT before transport actually accepted it.
+  if (deferUntilCommit(() => deliverNotifications(limit))) return;
+  const settings = await db.programSettings.findUnique({
+    where: { id: "program" },
+  });
+  if (!settings?.emailNotificationsEnabled) {
+    await db.emailDelivery.updateMany({
+      where: { status: "PENDING", category: { not: "security" } },
+      data: { status: "SKIPPED", completedAt: new Date() },
+    });
+  }
+  if (
+    !isEmailDeliveryAvailable("SECURITY") &&
+    !isEmailDeliveryAvailable("PROGRAM")
+  )
+    return;
+  const rows = await db.$queryRaw<{ id: string }[]>`
+    UPDATE "EmailDelivery" SET "leaseUntil" = NOW() + INTERVAL '5 minutes'
+    WHERE id IN (SELECT id FROM "EmailDelivery" WHERE status = 'PENDING' AND "availableAt" <= NOW()
+      AND ("leaseUntil" IS NULL OR "leaseUntil" < NOW()) ORDER BY "createdAt" LIMIT ${limit} FOR UPDATE SKIP LOCKED)
+    RETURNING id`;
+  for (const { id } of rows) {
+    const row = await db.emailDelivery.findUniqueOrThrow({
+      where: { id },
+      include: { user: { include: { emails: true } } },
+    });
+    if (row.status !== "PENDING") continue;
+    // Account security notices are essential; other notifications are program mail.
+    const category = row.category === "security" ? "SECURITY" : "PROGRAM";
+    if (!isEmailDeliveryAvailable(category)) {
+      // Defer unavailable-category notices without consuming a delivery attempt.
+      await db.emailDelivery.update({
+        where: { id },
+        data: { leaseUntil: null, availableAt: new Date(Date.now() + 60_000) },
+      });
+      continue;
+    }
+    const current = await db.programSettings.findUnique({
+      where: { id: "program" },
+    });
+    // Security notices are essential, including for legacy users with emailSecurity=false.
+    const essential = row.category === "security";
+    const preference =
+      row.category === "security"
+        ? true
+        : row.category === "messages"
+          ? row.user.emailMessages
+          : row.user.emailInfo;
+    const owned = row.user.emails.some(
+      (address) =>
+        address.email === row.recipient &&
+        address.verifiedAt &&
+        (address.email === row.user.email || row.user.emailSecondaryRecipients),
+    );
+    if (
+      row.user.mergedIntoId ||
+      (!essential && !current?.emailNotificationsEnabled) ||
+      !preference ||
+      (!owned && !row.previousPrimary)
+    ) {
+      await db.emailDelivery.update({
+        where: { id },
+        data: { status: "SKIPPED", completedAt: new Date(), leaseUntil: null },
+      });
+      continue;
+    }
+    const subject = descriptions[row.event] ?? "Your account was updated";
+    try {
+      // Build inside the retry boundary: bad origin configuration must release the lease too.
+      const link = emailUrl(
+        notificationDestination(
+          row.category,
+          row.event,
+          row.destination,
+          row.user.role,
+        ),
+      );
+      const timeZone = current?.timeZone ?? "Asia/Shanghai";
+      const time = new Intl.DateTimeFormat("en", {
+        dateStyle: "long",
+        timeStyle: "short",
+        timeZone,
+      }).format(row.createdAt);
+      const footer = essential
+        ? "If you do not recognize this activity, contact the program team through private support."
+        : "Sign in to review the update. You can manage optional email notifications in account settings.";
+      // Only optional notification classes receive this narrowly scoped account capability.
+      const unsubscribeUrl = ["messages", "info", "information"].includes(
+        row.category,
+      )
+        ? notificationUnsubscribeUrl(id)
+        : undefined;
+      await emailSender.send({
+        category,
+        to: row.recipient,
+        subject,
+        messageId: `<account-notice-${id}@shbs-notifications>`,
+        text: `${subject}.\n\n${time} (${timeZone})\n\n${footer}\n\n${link}${unsubscribeUrl ? `\n\nUnsubscribe: ${unsubscribeUrl}` : ""}`,
+        presentation: {
+          ...(unsubscribeUrl ? { unsubscribeUrl } : {}),
+          eyebrow: essential
+            ? "ACCOUNT SECURITY"
+            : row.category === "messages"
+              ? "PRIVATE MESSAGES"
+              : "PROGRAM UPDATE",
+          action: {
+            label:
+              row.category === "messages"
+                ? "Open your inbox"
+                : row.event === "program_update"
+                  ? "View program update"
+                  : "Review your account",
+            url: link,
+          },
+        },
+      });
+      // Opt-out can cancel a leased row while SMTP is in flight. Do not resurrect
+      // that cancellation when this attempt eventually completes or fails.
+      await db.emailDelivery.updateMany({
+        where: { id, status: "PENDING" },
+        data: {
+          status: "SENT",
+          completedAt: new Date(),
+          leaseUntil: null,
+          attempts: { increment: 1 },
+          lastError: null,
+        },
+      });
+    } catch {
+      // Store a safe diagnostic, never provider exceptions containing addresses or credentials.
+      const attempts = row.attempts + 1;
+      await db.emailDelivery.updateMany({
+        where: { id, status: "PENDING" },
+        data: {
+          status: attempts >= 5 ? "FAILED" : "PENDING",
+          attempts,
+          leaseUntil: null,
+          availableAt: new Date(Date.now() + 60_000 * 2 ** attempts),
+          lastError: "Email delivery failed; check the configured transport.",
+        },
+      });
+    }
+  }
+}
+
+const state = globalThis as typeof globalThis & {
+  notificationWorker?: ReturnType<typeof setInterval>;
+};
+export function startNotificationWorker() {
+  if (state.notificationWorker) return;
+  let running = false;
+  const run = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await deliverNotifications();
+    } catch {
+      console.error(
+        "[email-notifications] Delivery sweep failed; check database and transport availability.",
+      );
+    } finally {
+      running = false;
+    }
+  };
+  state.notificationWorker = setInterval(() => void run(), 30_000);
+  state.notificationWorker.unref();
+  void run();
+}

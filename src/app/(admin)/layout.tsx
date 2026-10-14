@@ -1,0 +1,177 @@
+import { accountPortalAccess } from "~/server/portal-access";
+import { WorkspaceHeader } from "~/app/_components/workspace-header";
+import { AdminPreferenceIdentity } from "~/app/_components/dismissible-notice";
+import Link from "next/link";
+import { redirect } from "next/navigation";
+import { getTranslations } from "next-intl/server";
+
+import { auth } from "~/server/auth";
+import { db } from "~/server/db";
+import { getFeatures } from "~/server/program/features";
+import { UserAvatar } from "~/app/_components/user-avatar";
+import { NavSidebar, NavMobileRow } from "~/app/_components/admin-nav";
+import { ReadOnlyProvider } from "~/app/_components/read-only";
+import { TEAM_TITLE } from "~/lib/branding";
+
+/**
+ * Gates management reads using current account capabilities. Departure observers receive
+ * the same read-only UI and API masking as standalone Viewers.
+ * Server-enforced; the middleware only checks authentication, not role.
+ */
+export default async function AdminLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const session = await auth();
+  const t = await getTranslations();
+
+  if (!session?.user) redirect("/signin");
+  const access = await accountPortalAccess(session.user.id);
+  if (!access.canReadManagement) redirect("/");
+  const readOnly = access.managementReadOnly;
+
+  // Username for the identity block in the top bar (account handle, falling back to a linked
+  // tutor's). The block links to the self-service account page. The tutor `status` decides whether
+  // to show the "Enter tutor" hop: an ARCHIVED tutor means can-tutor is off (not permitted) — we
+  // keep the link to preserve attributes, so check the live status rather than the JWT's tutorId.
+  const me = await db.user.findUnique({
+    where: { id: session.user.id },
+    select: {
+      username: true,
+      crewStatus: true,
+      tutorAccessRevoked: true,
+      suspendedAt: true,
+      tutor: { select: { username: true, status: true } },
+    },
+  });
+  // A suspended viewer keeps their login but is routed to the suspension/appeal screen.
+  if (me?.suspendedAt) redirect("/suspended");
+  // Permitted to tutor = a live linked tutor that hasn't been archived (can-tutor turned off).
+  // Keyed off the DB link (`me.tutor`), not the JWT's `session.tutorId`, so toggling can-tutor on
+  // shows the button on the next render without waiting for a re-login. The jwt callback keeps
+  // `session.tutorId` in sync too, so following the link into the tutor area resolves correctly.
+  const canEnterTutor = !me?.tutorAccessRevoked && !!me?.tutor && me.tutor.status !== "ARCHIVED";
+  const features = await getFeatures(db);
+  // Use one ordered list for visible shortcuts and the account submenu.
+  const workspaceItems = [
+    ...(canEnterTutor
+      ? [{ href: "/dashboard", label: t("components.userMenu.enterTutor") }]
+      : []),
+    ...(!readOnly || access.departed ? [{ href: "/student", label: t("components.userMenu.enterTutee") }] : []),
+  ];
+  const accountItems = [
+    ...workspaceItems,
+    {
+      href: readOnly ? "/messages" : "/admin/messages",
+      label: t("workflows.messages"),
+    },
+    {
+      href: readOnly ? "/student-support" : "/admin/student-support",
+      label: t("workflows.support"),
+    },
+    ...(features.CREW && me?.crewStatus === "ACTIVE"
+      ? [{ href: "/patrol", label: t("crew.nav.patrol") }]
+      : []),
+    { href: "/admin/account", label: t("account.title") },
+  ];
+
+  return (
+    <div className="admin-shell min-h-dvh lg:flex lg:h-dvh lg:flex-col lg:overflow-hidden">
+      {/* Unified top bar (all breakpoints): brand + the global controls. */}
+      <WorkspaceHeader
+        href="/admin"
+        title={TEAM_TITLE}
+        items={workspaceItems}
+        identity={
+          <Link
+            href="/admin/account"
+            className="hidden shrink-0 rounded-md px-2 py-1 text-right leading-tight hover:bg-slate-100 lg:block"
+            title={t("account.title")}
+          >
+            <p className="text-sm font-medium text-slate-900">
+              {session.user.name}
+            </p>
+            <p className="muted text-xs">
+              {(me?.username ?? me?.tutor?.username)
+                ? `@${me.username ?? me?.tutor?.username} · `
+                : ""}
+              {t(`admin.users.roles.${session.role}`)}
+            </p>
+          </Link>
+        }
+        account={
+          <UserAvatar
+            name={session.user.name ?? session.user.email ?? session.role}
+            username={me?.username ?? me?.tutor?.username}
+            email={session.user.email}
+            role={session.role}
+            items={accountItems}
+            compactAtDesktop
+          />
+        }
+        navigation={<NavMobileRow role={session.role} embedded />}
+      />
+
+      {/* The flex remainder follows the actual header height, including wrapping and zoom.
+          Each desktop pane owns its scroll; no fixed pixel header offset can hide links. */}
+      <div className="admin-workspace mx-auto flex w-full max-w-7xl gap-6 px-4 py-5 sm:py-6 lg:min-h-0 lg:flex-1 lg:overflow-hidden lg:px-6">
+        <NavSidebar role={session.role} />
+
+        {/* Main content. `data-readonly` exposes the read-only VIEWER role to globals.css, which keeps
+            only a thin destructive-control backstop; mutation panels are hidden per-page via
+            useReadOnly(), and the server-side adminProcedure checks are the real guard. */}
+        <main
+          id="admin-content"
+          tabIndex={0}
+          className="min-w-0 flex-1 focus-visible:outline-2 focus-visible:outline-offset-2 lg:overflow-y-auto lg:overscroll-contain lg:pr-3"
+          data-readonly={readOnly ? "" : undefined}
+        >
+          {readOnly && (
+            // Viewer's viewing pass — a welcoming accent strip, not an amber lockout warning
+            // (the program values transparency). The eye glyph carries the "viewer" identity, so
+            // the copy stays the single existing banner string.
+            <div className="border-accent-200 bg-accent-50 mb-5 flex items-center gap-3 rounded-xl border px-4 py-2.5">
+              <span
+                aria-hidden
+                className="bg-accent-100 text-accent-700 ring-accent-200 grid h-7 w-7 shrink-0 place-items-center rounded-full ring-1"
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+                  <circle cx="12" cy="12" r="2.6" />
+                </svg>
+              </span>
+              <p className="text-accent-800 text-sm leading-snug">
+                {t("admin.readOnly.banner")}
+              </p>
+            </div>
+          )}
+          {session.role === "COORDINATOR" && (
+            <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
+              <p>{t("approvals.trainingBanner")}</p>
+              <Link
+                className="link mt-1 inline-block"
+                href="/admin/approvals?status=all"
+              >
+                {t("approvals.myRequests")}
+              </Link>
+            </div>
+          )}
+          <ReadOnlyProvider value={readOnly}>
+            <AdminPreferenceIdentity value={session.user.id}>
+              {children}
+            </AdminPreferenceIdentity>
+          </ReadOnlyProvider>
+        </main>
+      </div>
+    </div>
+  );
+}

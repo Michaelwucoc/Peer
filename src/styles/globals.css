@@ -1,0 +1,594 @@
+@import "tailwindcss" source("../");
+
+@theme {
+  --font-sans:
+    var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+
+  /*
+   * Accent color scale — the single brand accent used across every interface (buttons, links,
+   * active nav, focus rings, badges). Backed by `--accent-*` CSS variables so that switching
+   * `data-theme` on <html> re-skins the whole app at runtime (see the theme blocks below and
+   * `~/lib/theme.ts`). Use `accent-50 … accent-950` Tailwind utilities; never hardcode a color.
+   */
+  --color-accent-50: var(--accent-50);
+  --color-accent-100: var(--accent-100);
+  --color-accent-200: var(--accent-200);
+  --color-accent-300: var(--accent-300);
+  --color-accent-400: var(--accent-400);
+  --color-accent-500: var(--accent-500);
+  --color-accent-600: var(--accent-600);
+  --color-accent-700: var(--accent-700);
+  --color-accent-800: var(--accent-800);
+  --color-accent-900: var(--accent-900);
+  --color-accent-950: var(--accent-950);
+
+  /* Legacy brand token (kept for back-compat); follows the active accent. */
+  --color-brand: var(--accent-600);
+}
+
+/*
+ * Theme palettes. Each maps the accent scale to one of Tailwind's built-in color ramps; the
+ * default (no attribute / indigo) is on :root. The picker (ThemeSwitcher) sets `data-theme`
+ * on <html>; the root layout restores it SSR from the THEME cookie so there's no flash.
+ */
+:root,
+[data-theme="indigo"] {
+  --action-background: var(--accent-600);
+  --action-hover: var(--accent-700);
+  --accent-50: var(--color-indigo-50);
+  --accent-100: var(--color-indigo-100);
+  --accent-200: var(--color-indigo-200);
+  --accent-300: var(--color-indigo-300);
+  --accent-400: var(--color-indigo-400);
+  --accent-500: var(--color-indigo-500);
+  --accent-600: var(--color-indigo-600);
+  --accent-700: var(--color-indigo-700);
+  --accent-800: var(--color-indigo-800);
+  --accent-900: var(--color-indigo-900);
+  --accent-950: var(--color-indigo-950);
+}
+[data-theme="violet"] {
+  --accent-50: var(--color-violet-50);
+  --accent-100: var(--color-violet-100);
+  --accent-200: var(--color-violet-200);
+  --accent-300: var(--color-violet-300);
+  --accent-400: var(--color-violet-400);
+  --accent-500: var(--color-violet-500);
+  --accent-600: var(--color-violet-600);
+  --accent-700: var(--color-violet-700);
+  --accent-800: var(--color-violet-800);
+  --accent-900: var(--color-violet-900);
+  --accent-950: var(--color-violet-950);
+}
+[data-theme="emerald"] {
+  --action-background: var(--accent-700);
+  --action-hover: var(--accent-800);
+  --accent-50: var(--color-emerald-50);
+  --accent-100: var(--color-emerald-100);
+  --accent-200: var(--color-emerald-200);
+  --accent-300: var(--color-emerald-300);
+  --accent-400: var(--color-emerald-400);
+  --accent-500: var(--color-emerald-500);
+  --accent-600: var(--color-emerald-600);
+  --accent-700: var(--color-emerald-700);
+  --accent-800: var(--color-emerald-800);
+  --accent-900: var(--color-emerald-900);
+  --accent-950: var(--color-emerald-950);
+}
+[data-theme="rose"] {
+  --accent-50: var(--color-rose-50);
+  --accent-100: var(--color-rose-100);
+  --accent-200: var(--color-rose-200);
+  --accent-300: var(--color-rose-300);
+  --accent-400: var(--color-rose-400);
+  --accent-500: var(--color-rose-500);
+  --accent-600: var(--color-rose-600);
+  --accent-700: var(--color-rose-700);
+  --accent-800: var(--color-rose-800);
+  --accent-900: var(--color-rose-900);
+  --accent-950: var(--color-rose-950);
+}
+[data-theme="amber"] {
+  --action-background: var(--accent-700);
+  --action-hover: var(--accent-800);
+  --accent-50: var(--color-amber-50);
+  --accent-100: var(--color-amber-100);
+  --accent-200: var(--color-amber-200);
+  --accent-300: var(--color-amber-300);
+  --accent-400: var(--color-amber-400);
+  --accent-500: var(--color-amber-500);
+  --accent-600: var(--color-amber-600);
+  --accent-700: var(--color-amber-700);
+  --accent-800: var(--color-amber-800);
+  --accent-900: var(--color-amber-900);
+  --accent-950: var(--color-amber-950);
+}
+[data-theme="sky"] {
+  --action-background: var(--accent-700);
+  --action-hover: var(--accent-800);
+  --accent-50: var(--color-sky-50);
+  --accent-100: var(--color-sky-100);
+  --accent-200: var(--color-sky-200);
+  --accent-300: var(--color-sky-300);
+  --accent-400: var(--color-sky-400);
+  --accent-500: var(--color-sky-500);
+  --accent-600: var(--color-sky-600);
+  --accent-700: var(--color-sky-700);
+  --accent-800: var(--color-sky-800);
+  --accent-900: var(--color-sky-900);
+  --accent-950: var(--color-sky-950);
+}
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+  }
+}
+
+/*
+ * Shared design system. Every interface (public, tutor, admin) is built from these
+ * primitives so the app reads as one product: a light slate canvas, white cards,
+ * and an indigo brand accent.
+ */
+
+/* Base utilities (registered with @utility so they can be composed via @apply). */
+@utility btn {
+  /* Minimum targets, rather than fixed heights, let translated labels wrap on touch screens.
+     Desktop keeps its existing row-specific sizes (including compact header controls). */
+  @apply focus-visible:ring-accent-500 inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-semibold whitespace-normal transition focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 lg:min-h-0 lg:min-w-0 lg:whitespace-nowrap;
+}
+@utility badge {
+  @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium;
+}
+/* Form control that grows/shrinks to fit its content instead of a fixed width.
+   `field-sizing: content` only takes effect when the width is auto, so reset the
+   `w-full` baked into `.input`/`.select`/`.textarea`. Pair with a `min-w-*`
+   (and optional `max-w-*`) at the call site so empty controls stay usable. */
+@utility field-auto {
+  field-sizing: content;
+  @apply w-auto max-w-full;
+}
+
+/* Wrapping forms can opt into a preferred minimum that never exceeds their
+   available width, even when rem-based sizing grows with enlarged text. Keep
+   this separate from field-auto so existing callers' fixed minima are intact. */
+@utility field-auto-bounded {
+  @apply field-auto;
+  min-width: min(100%, var(--field-min-width, 0px));
+}
+
+@layer components {
+  /* Buttons --------------------------------------------------------------- */
+  .btn-primary {
+    @apply btn bg-accent-600 hover:bg-accent-700 active:bg-accent-800 text-white;
+    /* Bright palettes keep their hue, with a deeper surface for readable white labels. */
+    background-color: var(--action-background);
+    &:hover {
+      background-color: var(--action-hover);
+    }
+    &:active {
+      background-color: var(--accent-800);
+    }
+  }
+  .btn-secondary {
+    @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-50;
+  }
+  /* Quiet actions still inherit the shared keyboard focus and disabled behavior. */
+  .btn-ghost {
+    @apply btn bg-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-900;
+  }
+  .btn-danger {
+    @apply btn bg-white text-red-600 hover:bg-red-50;
+  }
+  /* Size modifier — declared after variants so it overrides their padding. */
+  .btn-sm {
+    @apply px-3 py-1.5 text-xs;
+  }
+
+  /* Context sizes shared by the gallery and product; long translations may grow. */
+  .control-standard {
+    @apply min-h-11 min-w-11 lg:min-h-10;
+  }
+  .control-compact {
+    @apply min-h-11 min-w-11 px-3 py-2 lg:min-h-8 lg:py-1;
+  }
+  .choice-control {
+    @apply focus-visible:ring-accent-500 inline-flex items-center justify-center rounded-md border border-slate-300 bg-white text-sm font-medium text-slate-600 focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .choice-control[aria-pressed="true"] {
+    @apply border-accent-500 bg-accent-50 text-accent-800;
+  }
+  .section-tab {
+    @apply focus-visible:ring-accent-500 -mb-px border-b-2 border-transparent text-sm font-medium text-slate-600 focus-visible:ring-2 focus-visible:outline-none;
+  }
+  .section-tab[aria-selected="true"],
+  .section-tab[aria-current="page"] {
+    @apply border-accent-600 text-accent-800;
+  }
+  .switch-control {
+    @apply focus-visible:ring-accent-500 inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-md focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:opacity-50 lg:min-h-8;
+  }
+
+  /* Inline text links (table actions etc.) -------------------------------- */
+  .link {
+    @apply text-accent-600 hover:text-accent-700 font-medium hover:underline;
+  }
+  .link-danger {
+    @apply font-medium text-red-600 hover:text-red-700 hover:underline;
+  }
+
+  /* Account actions share a quiet, right-aligned stack. No inter-action gap: the
+     targets themselves provide 28px desktop / 44px touch spacing without clipping labels. */
+  .table-account-actions {
+    @apply flex min-w-28 flex-col items-stretch;
+  }
+  .table-account-action {
+    @apply focus-visible:ring-accent-500 inline-flex min-h-11 w-full items-center justify-end rounded-sm py-1 text-right text-sm leading-5 whitespace-normal focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 lg:min-h-7;
+  }
+
+  /* Form controls --------------------------------------------------------- */
+  .label {
+    @apply block text-sm font-medium text-slate-700;
+  }
+  .input,
+  .select,
+  .textarea {
+    @apply focus:border-accent-500 focus:ring-accent-500 min-h-11 w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm placeholder:text-slate-400 focus:ring-1 focus:outline-none lg:min-h-0;
+  }
+
+  /* Standalone text actions (resend, account recovery and table actions) remain usable on
+     touch screens too. Avoid changing ordinary unstyled prose links or icon artwork. */
+  @media (width < 64rem) {
+    :is(a, button, summary).link,
+    :is(a, button, summary).link-danger {
+      @apply inline-flex min-h-11 min-w-11 items-center whitespace-normal;
+    }
+  }
+
+  /* Surfaces -------------------------------------------------------------- */
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white shadow-sm;
+  }
+  .page-title {
+    @apply text-2xl font-bold tracking-tight text-slate-900;
+  }
+  /* Section heading inside a card/panel — smaller than the page title. */
+  .section-title {
+    @apply text-lg font-semibold tracking-tight text-slate-900;
+  }
+  .muted {
+    @apply text-sm text-slate-500;
+  }
+
+  /* Public entry forms share a calm surface and predictable control rhythm.
+     Scope these rules so workspace headers and compact table controls keep
+     their own height hierarchy. Minimum heights allow translations to wrap. */
+  .public-form .card {
+    @apply rounded-2xl border-slate-200 shadow-sm;
+  }
+  .public-form :is(.input, .select, .btn-primary, .btn-secondary) {
+    @apply min-h-11 lg:min-h-10;
+  }
+  .public-form .label {
+    @apply mb-1.5;
+  }
+  .public-form-link {
+    @apply text-accent-700 hover:text-accent-800 focus-visible:ring-accent-500 inline-flex min-h-11 max-w-full items-center justify-center rounded-md px-1 py-1 font-medium text-wrap underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none lg:min-h-8;
+  }
+
+  /* Data tables ----------------------------------------------------------- */
+  .data-table {
+    @apply w-full border-collapse text-sm;
+  }
+  .data-table thead th {
+    @apply border-b border-slate-200 px-3 py-2 text-xs font-semibold tracking-wide text-slate-500 uppercase;
+  }
+  /* A bare <th> centers (browser default), so text headers misalign over their left-aligned
+     columns. Default every header / row-header cell to LEFT at zero specificity (:where) so a
+     per-cell `text-right`/`text-center` utility on the cell still wins. */
+  :where(.data-table th) {
+    text-align: left;
+  }
+  /* Row-header <th> cells (e.g. the meetings matrix's sticky name column) share the body cell box
+     so they line up with their row's <td>s. */
+  .data-table tbody td,
+  .data-table tbody th {
+    @apply border-b border-slate-100 px-3 py-2 align-middle;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr:hover {
+    @apply bg-slate-50/60;
+  }
+
+  /* Brief summary columns share one trailing text-action column on every viewport.
+     Only the table scrolls; sticky actions remain available without hunting sideways. */
+  .summary-table-scroll {
+    @apply focus-visible:ring-accent-500 relative max-w-full overflow-x-auto rounded-lg focus-visible:ring-2 focus-visible:outline-none;
+  }
+  .summary-table {
+    @apply w-full;
+  }
+  .summary-table .table-actions,
+  .summary-table .table-actions-heading {
+    @apply sticky right-0 z-10 bg-white text-right;
+    box-shadow: -1px 0 0 var(--color-slate-200);
+  }
+  .summary-table .table-actions-heading {
+    @apply bg-slate-50;
+  }
+  /* Adjacent 24px desktop / 44px narrow-screen targets
+     provide their own spacing; translated labels may still grow and wrap. */
+  .table-action-list {
+    @apply flex min-w-24 flex-col items-end gap-0;
+  }
+  .table-action-link {
+    @apply text-accent-700 focus-visible:ring-accent-500 inline-flex min-h-11 min-w-11 items-center justify-end rounded px-1 text-right text-xs font-medium hover:underline focus-visible:ring-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 lg:min-h-6;
+  }
+  @media print {
+    .summary-table-scroll {
+      overflow: visible;
+    }
+    .summary-table .table-actions,
+    .summary-table .table-actions-heading {
+      display: none;
+    }
+  }
+
+  /* Badges ---------------------------------------------------------------- */
+  .badge-green {
+    @apply badge bg-green-100 text-green-700;
+  }
+  .badge-amber {
+    @apply badge bg-amber-100 text-amber-700;
+  }
+  .badge-slate {
+    @apply badge bg-slate-100 text-slate-600;
+  }
+  .badge-red {
+    @apply badge bg-red-100 text-red-700;
+  }
+
+  /* Navigation ------------------------------------------------------------ */
+  .nav-link {
+    @apply flex min-h-11 items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 lg:min-h-0;
+  }
+  .nav-link-active {
+    @apply bg-accent-50 text-accent-700 hover:bg-accent-50 hover:text-accent-700;
+  }
+}
+
+/* Elements that only exist in the printed/PDF report (masthead kicker, running footer). */
+.print-only,
+.print-running-foot {
+  display: none;
+}
+
+/* Print / Save-as-PDF — used by the Reports page. The on-screen UI is untouched; here the same
+   markup is restyled into a "registrar's ledger": ink-on-paper, hairline rules, tabular figures,
+   a letterhead masthead, and a running footer — so a saved PDF reads like an institutional report
+   rather than a web screenshot. Design notes live alongside the Reports page. */
+@media print {
+  /* Desktop scroll panes must expand for multi-page reports instead of clipping the first screen. */
+  .admin-shell,
+  .admin-workspace,
+  #admin-content {
+    display: block !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+  @page {
+    margin: 1.6cm 1.4cm;
+  }
+
+  /* Drop app chrome + on-screen-only controls; reveal print-only document furniture. */
+  header,
+  aside,
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block;
+  }
+  .summary-table th.print-only,
+  .summary-table td.print-only {
+    display: table-cell;
+  }
+
+  /* Document base: dark ink, aligned numerals (ledger columns), colours/rules print as-is. */
+  body {
+    font-size: 10px;
+    line-height: 1.42;
+    color: #1b1b1b;
+    font-variant-numeric: tabular-nums;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .print-area {
+    margin: 0;
+  }
+  /* Tighten the generous on-screen section rhythm for paper. */
+  .print-area > * + * {
+    margin-top: 0.6rem !important;
+  }
+
+  /* Keep a heading / section title with the content that follows it; never split a small block. */
+  h1,
+  h2,
+  h3,
+  h4,
+  .report-section-head {
+    break-after: avoid;
+  }
+  .report-keep {
+    break-inside: avoid;
+  }
+
+  /* ---- Masthead (letterhead) ------------------------------------------------------------- */
+  .print-masthead {
+    border-top: 3px solid var(--accent-700, #4338ca) !important;
+    border-bottom: 0.75px solid #1b1b1b !important;
+    padding: 9px 0 7px !important;
+    margin-bottom: 14px;
+  }
+  .print-kicker {
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--accent-700, #4338ca);
+    margin-bottom: 3px;
+  }
+  .print-masthead h2 {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.015em;
+    line-height: 1.15;
+    color: #111;
+  }
+  .print-masthead .muted {
+    color: #6b6b6b;
+    letter-spacing: 0.02em;
+  }
+
+  /* ---- Key-figures band (summary): strip card chrome into clean ledger figures ----------- */
+  .print-area .card.p-3 {
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    padding: 1px 0 !important; /* horizontal spacing comes from the grid gap, so cells align */
+  }
+  .print-area .card.p-3 > p:first-child {
+    font-size: 7px;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: #6b6b6b;
+  }
+  .print-area .card.p-3 > p:last-child {
+    font-size: 13px;
+    font-weight: 700;
+    margin-top: 1px;
+    line-height: 1.1;
+    color: #1b1b1b;
+  }
+  /* The one accent moment in the body: the hero Total-hours figure, sized up to lead the band. */
+  .print-area .card.p-3 > p.text-accent-700 {
+    color: var(--accent-700, #4338ca) !important;
+    font-size: 21px;
+    line-height: 1;
+  }
+  /* Group eyebrows (Service hours / Sessions & attendance / Activity) — label, no rule. */
+  .report-keep .report-section-head {
+    border-bottom: 0 !important;
+  }
+  .report-keep .report-section-head h4 {
+    font-size: 8px;
+    letter-spacing: 0.16em;
+    color: #111;
+  }
+  /* The group remark (e.g. "Total = earned + extras − penalties") is a footnote, not a heading:
+     keep it smaller and lighter than the group label so it never reads as the important part. */
+  .report-caption {
+    font-size: 6.5px !important;
+    color: #9a9a9a !important;
+    letter-spacing: 0 !important;
+  }
+
+  /* ---- Ledger sections: ruled section heads + hairline tables ---------------------------- */
+  .card {
+    border: 0 !important;
+    box-shadow: none !important;
+    background: transparent !important;
+  }
+  .card.overflow-x-auto,
+  .overflow-x-auto {
+    overflow: visible !important;
+  }
+  .report-section-head {
+    border-bottom: 0.75px solid #1b1b1b;
+    padding-bottom: 2px;
+  }
+  .report-section-head .section-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #111;
+  }
+
+  .data-table {
+    width: 100%;
+    font-size: 8.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  .data-table thead {
+    display: table-header-group; /* repeat the header on each printed page */
+  }
+  .data-table thead th {
+    font-size: 7px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: #333;
+    border-bottom: 0.75px solid #1b1b1b;
+    padding: 3px 6px;
+  }
+  .data-table tbody td {
+    border-bottom: 0.4px solid #e3e3e3;
+    padding: 2px 6px;
+  }
+  .data-table tbody tr:hover {
+    background: transparent !important;
+  }
+  tr {
+    break-inside: avoid;
+  }
+
+  /* ---- Closing footer (program · period) -----------------------------------------------
+     Kept in normal flow (after the last section) rather than position:fixed — Chrome's print
+     engine doesn't reserve space for fixed elements, so a fixed footer overlaps table content. */
+  .print-running-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    break-inside: avoid;
+    margin-top: 16px;
+    padding-top: 4px;
+    border-top: 0.5px solid #cfcfcf;
+    font-size: 7.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #6b6b6b;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Read-only (VIEWER) backstop. Mutation *panels* are hidden per-page via
+ * useReadOnly(), so a viewer keeps full use of read-only info controls — filters,
+ * month/period pickers, search boxes, sort headers, expand/collapse, and
+ * CSV/Print/export. This unlayered rule is only a thin safety net for destructive
+ * controls, which never make sense for a viewer and could otherwise surface on a
+ * page reached by direct URL (the server refuses the mutation regardless).
+ * Unlayered so it outranks the @layer components definition of the danger classes.
+ * ------------------------------------------------------------------------- */
+[data-readonly] .btn-danger,
+[data-readonly] .link-danger {
+  display: none;
+}
+
+/* Dialog panel entrance (see confirm-dialog.tsx). Applied only under motion-safe, so
+   reduced-motion users get the panel with no movement. */
+@keyframes dialog-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

@@ -1,0 +1,321 @@
+import { afterAll, beforeEach, expect, it, vi } from "vitest";
+import type * as Notifications from "~/server/notifications/create";
+import type { EmailMessage } from "~/server/email/sender";
+
+vi.mock("~/server/auth", () => ({ auth: async () => null }));
+const mail = vi.hoisted(() => ({ send: vi.fn<(message: EmailMessage) => Promise<void>>() }));
+vi.mock("~/server/email/sender", () => ({
+  emailSender: { send: mail.send },
+  isEmailDeliveryAvailable: () => true,
+}));
+vi.mock("~/server/notifications/create", async (importOriginal) => {
+  const actual = await importOriginal<typeof Notifications>();
+  return { ...actual, notifyAdmins: vi.fn(actual.notifyAdmins) };
+});
+
+import { db } from "~/server/db";
+import { createCaller } from "../root";
+import { currentPolicy } from "~/server/policy-acceptance";
+import { notifyAdmins } from "~/server/notifications/create";
+import { assertIsolatedTestDatabase } from "~/test/database-guard";
+import { stageCrewVerification, verifyCrewApplication } from "~/server/crew/signup";
+import {
+  APPLICATION_EMAIL_MAX,
+  APPLICATION_IP_MAX,
+  applicationClientIp,
+  applicationLimitKey,
+} from "~/server/public-application-intake";
+
+const client = (ip = "192.0.2.1") =>
+  createCaller({
+    db,
+    session: null,
+    headers: new Headers({ "x-forwarded-for": ip }),
+  });
+const tutorInput = async (email = "applicant@example.test") => ({
+  name: "Original applicant",
+  email,
+  preferredContact: "Email",
+  agreed: true as const,
+  policyRevision: (await currentPolicy(db, "tutor-policy")).revision,
+  subjects: [{ subjectId: "intake-math" }],
+});
+const crewInput = (email = "applicant@example.test") => ({
+  name: "Original applicant",
+  email,
+  message: "Original message",
+});
+// These tests isolate durable intake capacity; mailbox admission is covered by
+// crew/signup and CAPTCHA tests. Crew reaches this boundary only after its OTP.
+async function verifiedCrew(input: ReturnType<typeof crewInput>, ip = "192.0.2.1") {
+  await stageCrewVerification(db, input.email, input);
+  const code = mail.send.mock.calls.filter(([message]) => message.to === input.email.toLowerCase()).at(-1)?.[0].presentation?.code;
+  if (!code) throw Error("Expected crew mailbox challenge");
+  await verifyCrewApplication(db, { email: input.email, code }, new Headers({ "x-forwarded-for": ip }));
+  return { ok: true };
+}
+const bucket = (
+  scope: "email" | "ip",
+  value: string,
+  count: number,
+  expired = false,
+) =>
+  db.publicApplicationRateLimit.create({
+    data: {
+      key: applicationLimitKey(scope, value),
+      count,
+      resetsAt: new Date(Date.now() + (expired ? -1_000 : 60_000)),
+    },
+  });
+
+/** Assert the actual review authority, including exclusion of inactive accounts;
+ * retry tests also prove each eligible reviewer receives exactly one notice. */
+async function expectReviewerNotifications(roles: readonly string[], copies = 1) {
+  const notifications = await db.notification.findMany({
+    include: { user: { select: { role: true, suspendedAt: true, mergedIntoId: true } } },
+  });
+  expect(notifications).toHaveLength(roles.length * copies);
+  expect(notifications.map(row => row.user.role).sort()).toEqual(
+    Array.from({ length: copies }, () => [...roles]).flat().sort(),
+  );
+  expect(notifications.every(row => !row.user.suspendedAt && !row.user.mergedIntoId)).toBe(true);
+}
+
+beforeEach(async () => {
+  assertIsolatedTestDatabase(process.env.DATABASE_URL);
+  if (new URL(process.env.DATABASE_URL!).pathname !== "/shbs_shipping_test")
+    throw new Error("Use shbs_shipping_test");
+  const tables = await db.$queryRaw<
+    { tablename: string }[]
+  >`SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> '_prisma_migrations'`;
+  await db.$executeRawUnsafe(
+    "TRUNCATE " +
+      tables
+        .map((t) => '"' + t.tablename.replaceAll('"', '""') + '"')
+        .join(",") +
+      " CASCADE",
+  );
+  vi.mocked(notifyAdmins).mockClear();
+  mail.send.mockReset().mockResolvedValue(undefined);
+  for (const role of ["HEAD", "ADMIN", "COORDINATOR"] as const)
+    await db.user.create({
+      data: { id: `intake-${role.toLowerCase()}`, name: role, email: `${role}@example.test`, role },
+    });
+  await db.user.createMany({ data: [
+    { id: "intake-suspended-admin", name: "Suspended Admin", email: "suspended-admin@example.test", role: "ADMIN", suspendedAt: new Date() },
+    { id: "intake-merged-admin", name: "Retired Admin", email: "merged-admin@example.test", role: "ADMIN", mergedIntoId: "intake-admin" },
+  ] });
+  await db.policyDocument.create({
+    data: {
+      slug: "tutor-policy",
+      locale: "en",
+      title: "Policy",
+      body: "Synthetic policy",
+    },
+  });
+  await db.term.create({
+    data: { name: "Q1", schoolYear: "26-27", quarter: "Q1", active: true },
+  });
+  await db.subject.create({ data: { id: "intake-math", name: "Math" } });
+});
+afterAll(() => db.$disconnect());
+
+it("serializes concurrent tutor retries across address casing and networks without extra notices", async () => {
+  const input = await tutorInput();
+  const result = await Promise.all(
+    Array.from({ length: 6 }, (_, i) =>
+      client(`192.0.2.${i + 1}`).application.submit({
+        ...input,
+        email: i % 2 ? input.email.toUpperCase() : input.email,
+      }),
+    ),
+  );
+  expect(result).toEqual(Array.from({ length: 6 }, () => ({ ok: true })));
+  expect(await db.tutorApplication.count()).toBe(1);
+  await expectReviewerNotifications(["HEAD", "ADMIN"]);
+  expect(await db.publicApplicationRateLimit.count()).toBe(2);
+  expect(
+    (await db.publicApplicationRateLimit.findMany()).every(
+      (row) => row.count === 1,
+    ),
+  ).toBe(true);
+  await client().application.submit({
+    ...input,
+    name: "Untrusted replacement",
+  });
+  expect((await db.tutorApplication.findFirstOrThrow()).name).toBe(input.name);
+});
+
+it("serializes crew retries, preserves answers and does not disclose the earlier application", async () => {
+  const input = crewInput();
+  await stageCrewVerification(db, input.email, input);
+  const code = mail.send.mock.calls.at(-1)?.[0].presentation?.code;
+  if (!code) throw Error("Expected crew mailbox challenge");
+  await Promise.all(
+    Array.from({ length: 6 }, (_, i) =>
+      verifyCrewApplication(db, {
+        email: i % 2 ? input.email.toUpperCase() : input.email,
+        code,
+      }, new Headers({ "x-forwarded-for": "192.0.2.1" })),
+    ),
+  );
+  expect(await db.crewApplication.count()).toBe(1);
+  await expectReviewerNotifications(["HEAD"]);
+  await expect(
+    verifiedCrew({ ...input, message: "Replace this" }),
+  ).resolves.toEqual({ ok: true });
+  expect((await db.crewApplication.findFirstOrThrow()).message).toBe(
+    input.message,
+  );
+});
+
+it("treats an interview as pending, while allowing a new submission after a decision", async () => {
+  const input = await tutorInput();
+  await client().application.submit(input);
+  await db.tutorApplication.updateMany({ data: { status: "INTERVIEW" } });
+  await client().application.submit(input);
+  expect(await db.tutorApplication.count()).toBe(1);
+  await db.tutorApplication.updateMany({ data: { status: "REJECTED" } });
+  await client().application.submit(input);
+  expect(await db.tutorApplication.count()).toBe(2);
+  await expectReviewerNotifications(["HEAD", "ADMIN"], 2);
+});
+
+it("shares the email allowance between tutor and crew, and rolls back the over-limit transaction", async () => {
+  const input = await tutorInput();
+  await bucket("email", input.email, APPLICATION_EMAIL_MAX - 1);
+  const results = await Promise.allSettled([
+    client().application.submit(input),
+    verifiedCrew(crewInput(input.email), "192.0.2.2"),
+  ]);
+  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  const rejected = results.find((r) => r.status === "rejected");
+  expect(rejected?.status === "rejected" && rejected.reason).toMatchObject({
+    code: "TOO_MANY_REQUESTS",
+  });
+  expect(
+    (await db.tutorApplication.count()) + (await db.crewApplication.count()),
+  ).toBe(1);
+  await expectReviewerNotifications((await db.tutorApplication.count()) > 0 ? ["HEAD", "ADMIN"] : ["HEAD"]);
+  expect(
+    (
+      await db.publicApplicationRateLimit.findUniqueOrThrow({
+        where: { key: applicationLimitKey("email", input.email) },
+      })
+    ).count,
+  ).toBe(APPLICATION_EMAIL_MAX);
+});
+
+it("serializes the last network allowance across distinct emails", async () => {
+  await bucket("ip", "192.0.2.1", APPLICATION_IP_MAX - 1);
+  const results = await Promise.allSettled(
+    Array.from({ length: 4 }, (_, i) =>
+      verifiedCrew(crewInput(`applicant${i}@example.test`)),
+    ),
+  );
+  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  expect(results.filter((r) => r.status === "rejected")).toHaveLength(3);
+  expect(await db.crewApplication.count()).toBe(1);
+  expect(await db.publicApplicationRateLimit.count()).toBe(2);
+  await expect(
+    verifiedCrew(crewInput("other@example.test"), "192.0.2.2"),
+  ).resolves.toEqual({ ok: true });
+});
+
+it("keeps retries successful when limits are full, without reserving more capacity", async () => {
+  const input = crewInput();
+  await verifiedCrew(input);
+  await db.publicApplicationRateLimit.updateMany({
+    data: { count: APPLICATION_IP_MAX },
+  });
+  await expect(verifiedCrew(input)).resolves.toEqual({
+    ok: true,
+  });
+  expect(
+    (await db.publicApplicationRateLimit.findMany()).every(
+      (row) => row.count === APPLICATION_IP_MAX,
+    ),
+  ).toBe(true);
+  await expectReviewerNotifications(["HEAD"]);
+});
+
+it("resets expired email and network windows and prunes old unrelated counters", async () => {
+  const input = crewInput();
+  await bucket("email", input.email, APPLICATION_EMAIL_MAX, true);
+  await bucket("ip", "192.0.2.1", APPLICATION_IP_MAX, true);
+  await db.publicApplicationRateLimit.create({
+    data: {
+      key: "expired",
+      count: 999,
+      resetsAt: new Date(Date.now() - 8 * 24 * 60 * 60_000),
+    },
+  });
+  await verifiedCrew(input);
+  const rows = await db.publicApplicationRateLimit.findMany();
+  expect(rows).toHaveLength(2);
+  expect(
+    rows.every((row) => row.count === 1 && row.resetsAt > new Date()),
+  ).toBe(true);
+});
+
+it("rolls back application and capacity when notification fan-out fails, then permits a retry", async () => {
+  vi.mocked(notifyAdmins).mockRejectedValueOnce(
+    new Error("Synthetic notification failure"),
+  );
+  await expect(verifiedCrew(crewInput())).rejects.toThrow(
+    "Synthetic notification failure",
+  );
+  expect(await db.crewApplication.count()).toBe(0);
+  expect(await db.publicApplicationRateLimit.count()).toBe(0);
+  expect(await db.notification.count()).toBe(0);
+  await expect(verifiedCrew(crewInput())).resolves.toEqual({
+    ok: true,
+  });
+  await expectReviewerNotifications(["HEAD"]);
+});
+
+it("checks policy and subject validity even on retries, without consuming capacity", async () => {
+  const input = await tutorInput();
+  await client().application.submit(input);
+  await expect(
+    client().application.submit({ ...input, policyRevision: "stale" }),
+  ).rejects.toMatchObject({ code: "CONFLICT" });
+  await expect(
+    client().application.submit({
+      ...input,
+      subjects: [{ subjectId: "missing" }],
+    }),
+  ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  expect(
+    (await db.publicApplicationRateLimit.findMany()).every(
+      (row) => row.count === 1,
+    ),
+  ).toBe(true);
+  await expectReviewerNotifications(["HEAD", "ADMIN"]);
+});
+
+it("does not reserve capacity while crew is disabled or tutor recruitment is closed", async () => {
+  await db.programFeature.create({ data: { key: "CREW", enabled: false } });
+  await db.term.updateMany({ data: { tutorSignupEnabled: false } });
+  await expect(
+    client().crew.submitApplication(crewInput()),
+  ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  await expect(
+    client().application.submit(await tutorInput()),
+  ).rejects.toMatchObject({ code: "PRECONDITION_FAILED" });
+  expect(await db.publicApplicationRateLimit.count()).toBe(0);
+});
+
+it("canonicalizes IPv6 networks and mapped IPv4, and safely groups missing or invalid headers", () => {
+  const ip = (value: string) =>
+    applicationClientIp(new Headers({ "x-forwarded-for": value }));
+  expect(ip("2001:0DB8:0001:0002::abcd")).toBe(ip("2001:db8:1:2::ffff"));
+  expect(ip("::ffff:192.0.2.1")).toBe(ip("192.0.2.1"));
+  expect(ip("192.0.2.1, 198.51.100.1")).toBe("192.0.2.1");
+  expect(ip("not an address")).toBe("unknown");
+  expect(ip("fe80::1%en0")).toBe("unknown");
+  expect(applicationClientIp(new Headers())).toBe("unknown");
+  expect(applicationClientIp(new Headers({ "x-real-ip": "192.0.2.2" }))).toBe(
+    "192.0.2.2",
+  );
+});
