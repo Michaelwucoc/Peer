@@ -18,6 +18,7 @@ These guides describe the current application. Choose the task you need to compl
 | Adapt the English/Chinese policy drafts and publish school-approved revisions | [Policy drafts and publication](policies/README.md) |
 | Import pre-site history and link accountless tutees | [Historical participant transition](historical-participant-transition.md) |
 | Report a bug, enhancement, feature or documentation request | [Issue guide](issues.md) |
+| Work with the agent skills (issue tracker, labels, vocabulary) | [Issue tracker](agents/issue-tracker.md), [triage labels](agents/triage-labels.md) and [domain docs](agents/domain.md) |
 | Understand public signup limits and recovery | [Signup protection](signup-protection.md) |
 | Configure optional Aliyun CAPTCHA and plan rollout | [CAPTCHA guide](captcha.md) |
 | Review dated production host and external network evidence | [Issue #242 evidence and remaining work](continuation/issue-242.md) |
