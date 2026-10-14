@@ -148,6 +148,20 @@ weight, not an arbitrary height difference.
   [issue conventions](docs/issues.md), link PRs to their issues, and keep broader
   migration trackers open when only part of their scope is delivered.
 
+## Agent skills
+
+### Issue tracker
+
+Issues live as GitHub Issues, driven with the `gh` CLI; this clone is the `Michaelwucoc/Peer` fork of the upstream `DupeisTaken/shbs-peer-tutoring-website`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`); wayfinder tickets carry `wayfinder:map` / `-research` / `-prototype` / `-grilling` / `-task`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context — one `CONTEXT.md` and one `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 <!-- BEGIN:nextjs-agent-rules -->
 
 # This is NOT the Next.js you know
