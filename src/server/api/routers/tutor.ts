@@ -1873,13 +1873,21 @@ export const tutorRouter = createTRPCRouter({
           message: "Too late to change — this meeting is within 60 minutes.",
         });
       }
-      // Only remove a tutor-submitted excuse (excusedAt set), never an admin-recorded status.
-      await ctx.db.meetingAttendance.deleteMany({
-        where: {
-          meetingId: input.meetingId,
-          tutorId: ctx.session.tutorId,
-          excusedAt: { not: null },
-        },
+      // Only remove a tutor-submitted excuse (excusedAt set), never a staff-recorded
+      // status: the staff path clears excusedAt when it overwrites a row. Deleting an
+      // excuse changes the tutor's unexcused count, so rebuild the deduction ledger
+      // under the same lock the excuse flow uses — the two must never drift apart.
+      await ctx.db.$transaction(async (tx) => {
+        await lockEntity(tx, `meeting-hours:${ctx.session.tutorId}`);
+        const removed = await tx.meetingAttendance.deleteMany({
+          where: {
+            meetingId: input.meetingId,
+            tutorId: ctx.session.tutorId,
+            excusedAt: { not: null },
+          },
+        });
+        if (removed.count > 0)
+          await reconcileMeetingHours(tx, ctx.session.tutorId);
       });
       return { ok: true };
     }),

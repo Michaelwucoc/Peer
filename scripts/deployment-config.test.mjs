@@ -223,6 +223,16 @@ test("proxy policy preserves the single client-IP overwrite and separates enforc
     1,
   );
   assert.doesNotMatch(caddy, /header_up [+-]X-Signup-Client-IP/);
+  // Public per-IP throttles read X-Forwarded-For / X-Real-IP, so the boundary must
+  // replace the visitor's value on those too (docs/deployment.md: proxy trust).
+  for (const header of ["X-Real-IP", "X-Forwarded-For"]) {
+    assert.equal(
+      caddy.match(new RegExp(`header_up ${header} \\{remote_host\\}`, "g"))?.length,
+      1,
+      `${header} must be overwritten exactly once at the proxy`,
+    );
+    assert.doesNotMatch(caddy, new RegExp(`header_up [+-]${header}`));
+  }
   assert.match(caddy, /header \{\s+defer/);
   assert.match(caddy, /Strict-Transport-Security "max-age=86400"/);
   assert.match(caddy, /X-Content-Type-Options "nosniff"/);

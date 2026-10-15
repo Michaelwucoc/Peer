@@ -2,7 +2,7 @@ import Link from "next/link";
 import { shortSignupHref } from "~/lib/public-signup-links";
 
 import { Markdown } from "~/app/_components/markdown";
-import { pickLocalized, type Block, type LeafBlock } from "~/lib/page-blocks";
+import { isSafeButtonHref, pickLocalized, type Block, type LeafBlock } from "~/lib/page-blocks";
 
 /**
  * Renderers for the content blocks (RICH_TEXT / IMAGE / BUTTONS / COLUMNS). Shared by the landing
@@ -20,7 +20,9 @@ export function ButtonRow({
 }) {
   const buttons = block.buttons
     .map((b) => ({ ...b, label: pickLocalized(b.label, locale) }))
-    .filter((b) => b.label.trim() && b.href);
+    // A value stored before the schema check must not reach a raw `<a href>`; dropping it
+    // keeps a `javascript:` payload out of every visitor's click path.
+    .filter((b) => b.label.trim() && isSafeButtonHref(b.href));
   if (buttons.length === 0) return null;
   return (
     <div className={`flex flex-wrap gap-3 ${block.align === "center" ? "justify-center" : ""}`}>

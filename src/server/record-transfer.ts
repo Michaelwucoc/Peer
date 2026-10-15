@@ -116,6 +116,23 @@ async function catalogue(tx: TransactionDb) {
   );
 }
 
+/** A single plain address: no whitespace, comma, quotes or angle brackets, and a real domain. */
+const EMAIL_ADDRESS = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
+
+/** These archive columns are handed to the mailer, which parses a whole address list out of
+ * the value: a CR/LF, comma or display name in the cell can deflect the envelope elsewhere. */
+function parseEmailCell(value: string, column: Column): string {
+  const email = value.trim();
+  // An empty cell means empty text, not null; a nullable address keeps that meaning.
+  if (!email) {
+    if (column.nullable) return "";
+    fail(`${column.name} cannot be empty.`);
+  }
+  if (email.length > 254 || !EMAIL_ADDRESS.test(email))
+    fail(`${column.name}: use one plain email address, e.g. person@example.edu.`);
+  return email;
+}
+
 function parseValue(cell: string, column: Column): unknown {
   const value = decodeRecordCell(cell);
   if (value === null) {
@@ -174,6 +191,8 @@ function parseValue(cell: string, column: Column): unknown {
   }
   if (column.primary && !value.trim())
     fail(`${column.name}: an ID is required.`);
+  if (column.type === "text" && /email$/i.test(column.name))
+    return parseEmailCell(value, column);
   return value;
 }
 

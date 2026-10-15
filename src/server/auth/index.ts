@@ -12,7 +12,7 @@ import { lockEntity } from "~/server/transactions";
 import { db } from "~/server/db";
 import { getFeatures } from "~/server/program/features";
 import { authConfig } from "./config";
-import { clientIpFromRequest, verifySigninPassword } from "./credentials";
+import { clientIpFromRequest, signinRateLimited, verifySigninPassword } from "./credentials";
 import { verifyLoginCode } from "./two-factor";
 import { ensureUserUsername } from "./username";
 import { resolveTutorLink } from "./tutor-link";
@@ -26,8 +26,9 @@ function bootstrapAdminEmails(): string[] {
 }
 
 const credentialsSchema = z.object({
-  // Username or email — resolved against User.email or the linked Tutor.username.
-  identifier: z.string().min(1),
+  // Username or email — resolved against User.email or the linked Tutor.username. The cap
+  // also bounds the suffix of this attempt's `signin:id` rate-limit bucket.
+  identifier: z.string().min(1).max(320),
   password: z.string().min(1),
 });
 
@@ -112,6 +113,10 @@ const {
           if (!user?.twoFactorEnabled || user.mergedIntoId) return null;
           const features = await getFeatures(db);
           if (!features.EMAIL_2FA) return null;
+          // A code POST is a credential attempt like any other: it shares the sign-in
+          // budgets, so a burst of guesses cannot skip the limiter of the password branch.
+          if (signinRateLimited(clientIpFromRequest(request), user.id))
+            throw new RateLimitedSignin();
           const ok = await verifyLoginCode(user.id, loginCode.data.code);
           return ok
             ? {

@@ -3045,6 +3045,57 @@ it("meeting excuses close 60 minutes before the meeting", async () => {
   });
   await tutor().tutor.excuseMeeting({ meetingId: m.id, reason: "Class" });
 });
+it("a staff-recorded meeting status cannot be cancelled through the tutor excuse flow", async () => {
+  const meeting = (i: number) =>
+    db.tutorMeeting.create({
+      data: {
+        title: `Ledger ${i}`,
+        date: new Date(Date.now() + (i + 2) * 3_600_000),
+        termId: "review-term",
+      },
+    });
+  const deductions = () =>
+    db.serviceHourAdjustment.count({
+      where: { tutorId: "review-tutor", id: { startsWith: "mtgabs_" } },
+    });
+  const unexcused = () =>
+    db.meetingAttendance.findMany({
+      where: { tutorId: "review-tutor", status: "UNEXCUSED_ABSENT" },
+      select: { reason: true, excusedAt: true },
+    });
+
+  const meetings = [];
+  for (let i = 0; i < 4; i++) meetings.push(await meeting(i));
+  // Tutor-submitted excuses alone never create a deduction.
+  for (const m of meetings)
+    await tutor().tutor.excuseMeeting({ meetingId: m.id, reason: "Class" });
+  expect(await deductions()).toBe(0);
+
+  // Staff then record four unexcused absences: past the three-absence allowance.
+  for (const m of meetings)
+    await caller().admin.recordMeetingAttendance({
+      meetingId: m.id,
+      entries: [{ tutorId: "review-tutor", status: "UNEXCUSED_ABSENT" }],
+    });
+  expect(await deductions()).toBe(1);
+  // The staff decision replaces the whole row: no stale excuse survives with it.
+  const rows = await unexcused();
+  expect(rows).toHaveLength(4);
+  for (const row of rows)
+    expect(row).toMatchObject({ reason: null, excusedAt: null });
+
+  // Cancelling the stale excuses must not delete the staff rows or their deduction.
+  for (const m of meetings)
+    await tutor().tutor.cancelMeetingExcuse({ meetingId: m.id });
+  expect(await unexcused()).toHaveLength(4);
+  expect(await deductions()).toBe(1);
+
+  // A later excuse reconciles the ledger; the staff decision must survive it.
+  const later = await meeting(9);
+  await tutor().tutor.excuseMeeting({ meetingId: later.id, reason: "Class" });
+  expect(await unexcused()).toHaveLength(4);
+  expect(await deductions()).toBe(1);
+});
 async function interviewFixture() {
   const panel = [];
   for (let i = 0; i < 3; i++) {

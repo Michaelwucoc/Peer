@@ -21,6 +21,8 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     headers: {
       "Content-Type": image.mimeType,
       "Content-Length": String(image.byteSize),
+      // Match the boundary policy: a stored upload is served as its declared image type.
+      "X-Content-Type-Options": "nosniff",
       // Immutable: a HomeImage row's bytes never change after upload.
       "Cache-Control": "public, max-age=31536000, immutable",
       ETag: `"${id}"`,
