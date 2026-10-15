@@ -254,7 +254,10 @@ ignored `.validation/security/` directory (`f-routers.md`, `g-races.md`,
 
 ### Verification (second pass)
 
-`npm run check` (0 errors), the full suite (358 files, 3,780 tests) against the
-isolated `shbs_shipping_test` database, `npm run test:deployment` (44) and
-`npm run docs:check` (12) all pass with the second-pass fixes included; the two
-new regression tests are part of the suite.
+`npm run check` (0 errors), the full suite (358 files, 3,779 tests, including the
+two new regression tests) against the isolated `shbs_shipping_test` database,
+`npm run test:deployment` (44) and `npm run docs:check` (12) all pass with the
+second-pass fixes included. Two earlier full-suite runs during the day reported
+failures that were caused by the local verification database being unreachable
+(it was in crash recovery after the saturation experiment killed the Docker
+daemon); the passing run above started after the database was restored.
