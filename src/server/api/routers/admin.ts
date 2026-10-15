@@ -3250,7 +3250,10 @@ export const adminRouter = createTRPCRouter({
                 tutorId: e.tutorId,
               },
             },
-            update: { status: e.status },
+            // A staff decision replaces the whole row: drop a tutor-submitted excuse
+            // (reason + excusedAt) so the tutor excuse-cancel path can never match,
+            // and no excuse text survives into a staff-recorded status.
+            update: { status: e.status, reason: null, excusedAt: null },
             create: {
               meetingId: input.meetingId,
               tutorId: e.tutorId,

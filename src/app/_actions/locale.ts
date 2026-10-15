@@ -17,5 +17,8 @@ export async function setLocale(locale: string): Promise<void> {
     path: "/",
     maxAge: 60 * 60 * 24 * 365,
     sameSite: "lax",
+    // The deployment is HTTPS-only behind Caddy; keep the preference off plain HTTP
+    // in production the same way the session and invitation cookies are.
+    secure: process.env.NODE_ENV === "production",
   });
 }

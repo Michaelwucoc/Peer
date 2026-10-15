@@ -142,16 +142,27 @@ export async function issuePasswordReset(identifier: string): Promise<void> {
 async function deliverResetLink(to: string, token: string): Promise<void> {
   const link = `${appBaseUrl()}/reset-password?token=${token}`;
 
-  await emailSender.send({
-    category: "SECURITY",
-    to,
-    subject: `Reset your ${APP_TITLE} password`,
-    text:
-      `We received a request to reset your ${APP_TITLE} password.\n\n` +
-      `Reset it within ${TOKEN_TTL_MINUTES} minutes:\n${link}\n\n` +
-      `If you didn't request this, you can safely ignore this email.`,
-    presentation: { action: { label: "Reset your password", url: link } },
-  });
+  // Best-effort by contract: the surrounding flow answers every identifier the same
+  // way, so a provider outage must not become a 500 on the hit path only — that
+  // enumerates accounts exactly when mail is down. Operators still get the log; the
+  // recipient address stays out of it.
+  try {
+    await emailSender.send({
+      category: "SECURITY",
+      to,
+      subject: `Reset your ${APP_TITLE} password`,
+      text:
+        `We received a request to reset your ${APP_TITLE} password.\n\n` +
+        `Reset it within ${TOKEN_TTL_MINUTES} minutes:\n${link}\n\n` +
+        `If you didn't request this, you can safely ignore this email.`,
+      presentation: { action: { label: "Reset your password", url: link } },
+    });
+  } catch (error) {
+    console.error(
+      "[password-reset] reset-link delivery failed",
+      error instanceof Error ? error.message : "Unknown error",
+    );
+  }
 }
 
 /**

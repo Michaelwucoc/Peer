@@ -628,6 +628,23 @@ it("a pending address cannot recover an account, and essential delivery outages 
   expect(mail.send).not.toHaveBeenCalled();
 });
 
+it("a delivery failure does not turn into an account-existence signal", async () => {
+  // A provider outage on the hit path must resolve like the miss path: the surrounding
+  // flow answers every identifier identically, and a throw for existing accounts only
+  // would enumerate them exactly when mail is down.
+  mail.available = true;
+  mail.send.mockRejectedValueOnce(new Error("SMTP transport failed"));
+  await expect(
+    issuePasswordReset(`${userId}@example.test`),
+  ).resolves.toBeUndefined();
+  // The miss path stays indistinguishable: no send and no throw either.
+  mail.send.mockClear();
+  await expect(
+    issuePasswordReset("nobody@example.test"),
+  ).resolves.toBeUndefined();
+  expect(mail.send).not.toHaveBeenCalled();
+});
+
 it("replacing an unverified primary permanently revokes its recovery grants", async () => {
   const previous = `${userId}@example.test`;
   await db.user.update({

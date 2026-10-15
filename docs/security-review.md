@@ -43,14 +43,14 @@ Status: **fixed** = changed in `e9cf5765`; **open** = filed as a follow-up ticke
 | F-A3 | The emailed-code (`login_2fa`) credential POST bypassed the sign-in throttle | Low | fixed |
 | F-C5 | The image upload route buffers the whole body before the 2 MB check and trusts the declared MIME | Low | partly fixed (`nosniff`); body check open |
 | F-C2 | tRPC responses carry no `Cache-Control`/`Vary` for per-user GET payloads | Low | open |
-| F-C3 | tRPC error bodies return the raw error message (driver text; stacks in development) | Low | open |
+| F-C3 | tRPC error bodies return the raw error message (driver text; stacks in development) | Low | refuted live (second pass): no stacks, driver text or internal paths in any reachable failure shape; the only echo is the requester's own submitted body in a malformed-JSON parse error |
 | F-C4 | `.env.example` (`SIGNUP_TRUST_PROXY=false`) contradicts Compose (`true`) | Low | open |
-| F-C6 | The proxy matcher sends `/robots.txt`, `/.well-known/*` and `/examples/*` to `/signin` | Low | open |
-| F-C7 / F-D3 | `/api/signin-qr` encodes `AUTH_URL ?? request.origin`, bypassing auth as `/api/*` | Low | open |
+| F-C6 | The proxy matcher sends `/robots.txt`, `/.well-known/*` and `/examples/*` to `/signin` | Low | open (confirmed live in the second pass) |
+| F-C7 / F-D3 | `/api/signin-qr` encodes `AUTH_URL ?? request.origin`, bypassing auth as `/api/*` | Low | open (origin fallback only; with `AUTH_URL` set the QR always encodes the configured origin — live-verified) |
 | F-D2 | The enforcing CSP has no `script-src`; the resource policy is report-only | Low | open (accepted) |
 | F-D4 | `/api/images/<id>` is world-readable and immutable for landing art held by id | Low | open (accepted) |
 | F-A4 | A non-chair tutor can file an interview-decision proposal (replay rejects it) | Low | open |
-| F-A5 | `/forgot-password` is a weak account-existence oracle (hit path awaits SMTP) | Low | open, needs runtime check |
+| F-A5 | `/forgot-password` is an account-existence oracle — worse than first assessed: a delivery failure turned into a hit-path-only HTTP 500 (a status-code oracle, not a timing one) | Low → Medium | fixed (second pass) |
 | F-A6 | Coordinator-"live" mutations re-read authority only before the transaction | Low | open |
 | F-A7 | `admin.sendTutorSetup`'s accountless branch is HEAD-only with no queue fallback | Low | open |
 | F-B3 | `registration.sendEmailCode` bills per code (not per address) and accepts an unbounded address | Low | open |
@@ -182,3 +182,79 @@ would have been attributable to this change set.
   live proxy behaviour after a Caddy reload.
 - Follow-up tickets for the open rows of the table are filed in this repository's
   issue tracker.
+
+## Second pass — deep-dive and live verification (2026-10-15)
+
+The first pass was static. The second pass ran three further read-only reviews over
+the ground it did not cover, plus a **live probe** of a production build running
+against a disposable, seeded local database with SMTP pointed at a sink and no
+Caddy in front (so request headers reach the app directly). Raw notes stay in the
+ignored `.validation/security/` directory (`f-routers.md`, `g-races.md`,
+`i-unverified.md`, `h-runtime.md`).
+
+### Live verdicts on the first pass
+
+| Item | Live verdict |
+| --- | --- |
+| F-A5 `/forgot-password` | **Worse than hypothesized and now fixed.** It is a *status-code* oracle, not a timing one: for an existing account any delivery failure surfaced as HTTP 500 (the reset token was already committed), while a non-existing account returned the generic page — 10/10 vs 8/8 samples, no overlap, both ~30 ms. Delivery failures are now caught and logged inside the reset flow, which restores the action's own "identical answer for every identifier" contract (`src/server/auth/password-reset.ts`, regression test in `src/server/auth/account-emails.test.ts`). |
+| F-C3 tRPC error bodies | **Refuted.** No stacks, driver text or internal paths in any reachable failure shape (unknown procedure, wrong method, unauthenticated, schema rejection, malformed envelope). The only echo is the requester's own submitted body in a malformed-JSON parse error. Ticket #6 closed with this evidence. |
+| F-C6 public paths | **Confirmed open**: `robots.txt`, `.well-known/*`, `examples/*`, `sitemap.xml`, `manifest.json` and the favicon variants all 307 to `/signin` unauthenticated (and 404 when signed in — the files do not exist). Ticket #4 stands. |
+| F-C7 QR origin | **Not exploitable while `AUTH_URL` is set**: the QR always encodes the configured origin; Host/`X-Forwarded-Host` manipulation changes nothing. The unthrottled PNG work (57 req/s of CPU) remains and is folded into ticket #10. |
+| First-pass fixes | **All four verified live.** Proxy-trust headers overwrite as configured; the limiter-saturation fix admits a real sign-in after 5,100 rotating-identity attempts (10,200+ keys, past the 10,000 cap) while the per-identifier cap still engages on the 11th same-identifier attempt; the `BUTTONS` scheme check rejects the write and drops a database-injected `javascript:` button at read; the image route serves `nosniff` and its 415/400/413 gates hold (a 100 MB body is rejected by the framework parser in 68 ms). |
+| Invariants that held live | A password change kills every session of the account (both pre-change cookies, pages, tRPC and the session endpoint); VIEWER masking is server-side (zero contact fields in the served payloads, narrative fields absent, `admin.accounts` 403); `callbackUrl` values clamp to `/`; 404/500 pages disclose nothing. |
+
+### Fixed in the second pass
+
+| Finding | Severity | Fix |
+| --- | --- | --- |
+| F-G1 — a staff-recorded meeting status could be deleted through the tutor excuse-cancel path (stale `excusedAt`), desynchronizing the 0.25 h missed-meeting deduction ledger | Medium | The staff path now replaces the whole row (`reason: null, excusedAt: null`), and the cancel path runs under the meeting-hours lock and reconciles the ledger like the excuse flow (`src/server/api/routers/tutor.ts`, `src/server/api/routers/admin.ts`; regression test in `src/server/api/routers/workflows.test.ts`) |
+| F-A5 / F-H2 — the `/forgot-password` status-code oracle above | Medium | See the live-verdict table |
+| F-I4 — the `NEXT_LOCALE` cookie carried no `secure` attribute | Low | Production now sets `secure`, matching the session and invitation cookies (`src/app/_actions/locale.ts`) |
+
+### New findings (filed as follow-up tickets)
+
+- **F-H1 (Medium)** — signing out clears the cookie but does not revoke the token:
+  the cleared cookie's token still authenticates the session endpoint and `/admin`
+  for its full 30-day life. A password write already revokes every session, so the
+  machinery exists; the open question is single-device versus all-device
+  semantics, which is a product decision (ticket filed as `ready-for-human`).
+- **F-G3 (Medium)** — the signup ingress counts its process-global 32-in-flight
+  cap against **every** tRPC request before the lane is determined: 32
+  slow-dripping bodies block all tRPC traffic process-wide with 429.
+- **F-F1 / F-G2 (Medium)** — service-hour adjustments are an unbounded,
+  non-idempotent append to a SUM-derived ledger, created ADMIN-direct while
+  deletion is Head-only: an ADMIN can mint unlimited hours, replay a request to
+  double an amount, or net out Head-reviewed deductions.
+- **F-F2 (Medium)** — `admin.deleteApplication` hard-deletes an INITIAL
+  application's interview panel, votes and decision (cascade), which contradicts
+  the history rule its sibling deletions enforce.
+- Low, filed: F-F3 (interview completion lacks its siblings' status guard),
+  F-F4 (tutor reactivation skips the academic confirmation the reentry path
+  enforces), F-F5 (ADMIN can re-issue participation codes Head revoked),
+  F-I1 (search filters treat `%`/`_` as wildcards — filter broadening only),
+  F-I2 (archive ZIP decode is unbounded CPU in the HEAD's own browser tab),
+  F-I3 (unsubscribe tokens are reusable for 90 days against optional mail).
+
+### Confirmed holding (second pass)
+
+- **Authorization**: no role escalation, no cross-user IDOR and no sub-ADMIN
+  reachability across the ~90 `admin` resolvers and the twelve further routers the
+  first pass had not audited; membership/departure/recall/suspension state
+  machines are HEAD-gated with in-transaction authority re-reads; the observer
+  projection is fail-closed on every management read touched.
+- **Serialization claims verified**: username allocation (shared advisory lock +
+  namespace guard upsert), room conflicts (application lock plus database
+  triggers that re-check on every write), and departure transitions (period and
+  profile locks, `FOR UPDATE`, monotonic revisions) all hold as documented.
+- **Resolved "could not verify" items**: the ZIP import's memory guard holds
+  (output clamped; the residual is CPU-only and client-side); CSV export
+  neutralisation is complete and reverses exactly on import; the QR payload is a
+  constant public URL; no service workers exist; `localStorage` holds no PII or
+  tokens; translated-message interpolations land in escaped text positions.
+
+### Verification (second pass)
+
+`npm run check` (0 errors), the full suite (358 files, 3,780 tests) against the
+isolated `shbs_shipping_test` database, `npm run test:deployment` (44) and
+`npm run docs:check` (12) all pass with the second-pass fixes included; the two
+new regression tests are part of the suite.
